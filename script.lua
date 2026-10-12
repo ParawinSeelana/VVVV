@@ -5,10 +5,6 @@ repeat task.wait() until game:IsLoaded()
 local GlobalEnv = getgenv()
 
 -- the lobby is its own place with the same remotes; lobby.lua covers it
-if game.PlaceId == 106484206883664 then
-    return
-end
-
 ---------------------------------------------- [ Prepare Project ] ----------------------------------------------
 
 local Collection = {}; Collection.__index = Collection
