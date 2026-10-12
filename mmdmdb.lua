@@ -259,19 +259,21 @@ Dungeon.State = {
     BossPhase = false,
     -- true while the farm loop still has an unlocked chest to open
     LootPending = false,
+    -- the boss is dead: nothing is left to fight, so the chests can be collected
+    Cleared = false,
 }
 
 Dungeon.Tuning = {
     RefillCooldown = 10, -- seconds before the same potion station is triggered again
     RoomOffset = Vector3.new(0, 3, 0), -- stand this far above a room's spawn marker
     ReplayDelay = 3, -- seconds after the completion screen before asking for a replay
-    ReplayLootWait = 30, -- longest the replay waits for leftover chests to be opened
+    ReplayLootWait = 120, -- longest the replay waits for leftover chests to be opened
     PromptOffset = Vector3.new(0, 4, 0), -- stand this far above a chest or altar prompt
     PromptRetry = 1, -- seconds between fires of the altar prompt
     PromptMaxTries = 4, -- give up on the altar prompt if it keeps not working
     ChestStep = 1.5, -- studs closer to a chest on each try
     ChestRetry = 0.4, -- seconds between tries on the same chest
-    ChestMaxTries = 60, -- safety stop (about 25 seconds) so one stuck chest cannot hang the run
+    ChestMaxTries = 10, -- a chest that has not opened after this many tries is skipped
     AltarRange = 200, -- only detour to the Blessing Altar when it is this close
 }
 
@@ -819,14 +821,18 @@ end
 
 --------------------------- [[ Between Fights ]] ---------------------------
 
--- Runs whenever no enemy is awake: loot, then the altar, then the next room.
+-- Runs whenever no enemy is awake: the altar, then the next room, and the chests once the
+-- whole dungeon is dead.
 function Dungeon:BetweenFights(RootPart, Folder)
     local Current = Dungeon:GetRoomAt(Folder, RootPart.Position)
     if Dungeon:IsRoomInProgress(Current) then
         return
     end
 
-    local ChestPrompt = Dungeon.State.Loot and Dungeon:GetChestPrompt(RootPart, Folder) or nil
+    -- Chests are left for the very end. Going for one mid-run teleports across rooms that are
+    -- still asleep, so nothing is looted until the boss is dead or no enemy is left at all.
+    local LootNow = Dungeon.State.Loot and (Dungeon.State.Cleared or #Folder.NPCs:GetChildren() == 0)
+    local ChestPrompt = LootNow and Dungeon:GetChestPrompt(RootPart, Folder) or nil
     Dungeon.State.LootPending = ChestPrompt ~= nil
     if ChestPrompt ~= nil then
         Dungeon:LootChest(RootPart, ChestPrompt)
@@ -1584,7 +1590,7 @@ end)
 --------------------------- [[ Dungeon ]] ---------------------------
 
 for _, Entry in {
-    { "AutoLoot",     "Loot",     "Auto loot chests",    "Open unlocked chests once every enemy is dead. Chests in locked areas are never touched" },
+    { "AutoLoot",     "Loot",     "Auto loot chests",    "Open every unlocked chest after the boss is dead, before the replay. Chests in locked areas are never touched" },
     { "AutoBlessing", "Blessing", "Auto blessing",       "Use the Blessing Altar when passing it and take the first blessing" },
     { "AutoPick",     "Pick",     "Auto pick chests",    "Take the highest rarity chests on the reward screen" },
     { "AutoReplay",   "Replay",   "Auto replay",         "Request a replay when the dungeon is completed" },
@@ -2085,6 +2091,7 @@ Collection:Track(Dungeon.RunEvents.PhaseChange.OnClientEvent:Connect(function(Ph
         Dungeon.State.BossPhase = true
     elseif Phase == "BossDefeated" then
         Dungeon.State.BossPhase = false
+        Dungeon.State.Cleared = true
     elseif Phase == "RoomCleared" then
         -- the last enemy room also reports the empty boss room (RoomIndex == TotalRooms) as
         -- cleared in the same instant; that one is not a room that was fought through
@@ -2096,10 +2103,12 @@ end))
 
 Collection:Track(Dungeon.RunEvents.ReplayStarting.OnClientEvent:Connect(function()
     Dungeon.State.BossPhase = false
+    Dungeon.State.Cleared = false
     Collection.WebhookState.RoomsCleared = 0
 end))
 
 Collection:Track(Dungeon.RunEvents.DungeonComplete.OnClientEvent:Connect(function(Data)
+    Dungeon.State.Cleared = true
     -- sent first: the replay that follows teleports away and takes this script with it
     if Collection.WebhookState.On then
         task.spawn(function()
@@ -2129,6 +2138,7 @@ task.spawn(function()
         return Completion.Visible and Completion.Content.ActionButtons.ReplayButton
     end)
     if ok and ReplayButton and ReplayButton.Visible then
+        Dungeon.State.Cleared = true
         Dungeon:FinishRun()
     end
 end)
