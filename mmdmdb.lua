@@ -9,6 +9,8 @@ local GlobalEnv = getgenv()
 local Collection = {}; Collection.__index = Collection
 local Dungeon = {}; Dungeon.__index = Dungeon
 local Lobby = {}; Lobby.__index = Lobby
+local Economy = {}; Economy.__index = Economy
+local BossRush = {}; BossRush.__index = BossRush
 
 local Services = setmetatable({}, {
     __index = function(_, k)
@@ -124,6 +126,19 @@ Lobby.SummonFunctions = Lobby.SummonService and Lobby.SummonService:WaitForChild
 Lobby.SummoningData = Collection:TryRequire("GameInfo", "SummoningData")
 Lobby.ClassData = Collection:TryRequire("Classes", "Class_Data")
 Lobby.RarityIndex = Collection.RarityIndex
+
+-- crafting recipes, appraisal prices, the merchant's catalogue and which gear cannot be sold
+Economy.CraftingData = Collection:TryRequire("GameInfo", "CraftingData")
+Economy.AppraisalData = Collection:TryRequire("GameInfo", "AppraisalData")
+Economy.MerchantData = Collection:TryRequire("GameInfo", "MysteryMerchantData")
+Economy.EquipmentTemplates = Collection:TryRequire("GameInfo", "EquipmentTemplates")
+Economy.AppraisalCosts = (Economy.AppraisalData and type(Economy.AppraisalData.Costs) == "table" and Economy.AppraisalData.Costs)
+    or { Common = 50, Rare = 100, Epic = 300, Legendary = 1000, Mythic = 2000, Celestial = 3000, Exotic = 6000 }
+
+-- Boss Rush shares the lobby's queue remotes; its own service carries the run's events
+BossRush.Service = KnitServices:WaitForChild("BossRushService", 5)
+BossRush.Events = BossRush.Service and BossRush.Service:WaitForChild("RE", 5)
+BossRush.Data = Collection:TryRequire("GameInfo", "BossRushData")
 
 -- InvokeServer on <Service>.RF.<Name>; returns pcall's ok followed by what the server returned
 function Lobby:Call(Service, Name, ...)
@@ -294,6 +309,7 @@ Lobby.State = {
     Auto = false,
     Dungeon = "Bandits Den",
     Difficulty = "Easy",
+    Best = false, -- enter the highest unlocked dungeon instead of the one chosen
     Delay = 5, -- seconds in the lobby before an automatic start, so there is time to switch it off
     RetryWait = 15, -- seconds before trying again after the server refuses a start
     Busy = false,
@@ -330,6 +346,40 @@ Lobby.AccountState = {
 -- lowest to highest, as the summoning screen lists them
 Lobby.RarityOrder = (Lobby.SummoningData and type(Lobby.SummoningData.RarityOrder) == "table" and Lobby.SummoningData.RarityOrder)
     or { "Rare", "Epic", "Legendary", "Mythic", "Celestial", "Exotic" }
+
+Economy.State = {
+    Craft = false,
+    Recipes = {}, -- [RecipeId] = true: craft as many of these as the materials allow
+    Sell = false,
+    SellRarities = {}, -- [Rarity] = true: unworn, unlocked gear of these rarities is sold
+    Buy = false,
+    GearRarities = {}, -- [Rarity] = true: equipment shop gear worth buying when it beats what is worn
+    MerchantItems = {}, -- [CatalogId] = true: bought from the Mystery Merchant while it is here
+    MerchantNext = 0, -- os.time() before which the merchant is not asked again
+    Appraise = false,
+    AppraisePicks = {}, -- [Label] = true: the eligible gear ticked in the window
+    AppraiseMap = {}, -- [Label] = the item behind it
+    CoinReserve = 0, -- coins that crafting and buying never dip into
+    StarReserve = 0, -- Stars that the merchant and appraisals never dip into
+    Interval = 60, -- seconds between passes; the shops restock every 5 to 10 minutes
+    Busy = false,
+    Done = false, -- the first pass has finished; Auto start waits for it
+    Status = "waiting",
+}
+
+BossRush.State = {
+    Auto = false,
+    FinalBoss = "Cursed King",
+    SkipFloor = 0, -- 0, or a floor in steps of 10 that skip tickets pay for
+    Fight = true,
+    Pick = true,
+    End = "Replay", -- "Stay" | "Replay" | "Return to lobby"
+    Milestones = true,
+    Busy = false,
+    Status = "off",
+    Arena = nil, -- the instance whose NPCs folder holds the bosses
+    LastSearch = 0,
+}
 
 --------------------------- [[ Targets ]] ---------------------------
 
@@ -638,8 +688,12 @@ end
 -- The server sends every chest's contents up front; the game only sends the picks when Finish
 -- is pressed. Chests are numbered left to right, and entries without a Rarity (spins, stars)
 -- rank lowest.
-function Dungeon:PickChests(Chests, OwnsExtraLoot, SelectRemote)
-    if not Dungeon.State.Pick or type(Chests) ~= "table" or #Chests == 0 then
+function Dungeon:PickChests(Chests, OwnsExtraLoot, SelectRemote, Enabled)
+    -- Enabled is the caller's own switch; without one the dungeon's Auto pick decides
+    if Enabled == nil then
+        Enabled = Dungeon.State.Pick
+    end
+    if not Enabled or type(Chests) ~= "table" or #Chests == 0 then
         return
     end
 
@@ -889,6 +943,13 @@ function Collection:FarmStep()
     local State = Collection.FarmState
     local RootPart = Collection:GetRoot()
     local Folder = RootPart and Dungeon:GetFolder()
+    -- no dungeon: the Boss Rush arena has enemies but no rooms, chests or altar (this loop
+    -- starts before the Boss Rush functions further down exist)
+    local InArena = false
+    if Folder == nil and RootPart ~= nil and BossRush.State.Fight and BossRush.GetArena ~= nil then
+        Folder = BossRush:GetArena()
+        InArena = Folder ~= nil
+    end
     if Folder == nil then
         Collection:Surface(RootPart)
         return
@@ -907,7 +968,9 @@ function Collection:FarmStep()
     local Target = Collection:GetNearestEnemy(RootPart, Folder)
     if Target == nil then
         Collection:Surface(RootPart)
-        Dungeon:BetweenFights(RootPart, Folder)
+        if not InArena then
+            Dungeon:BetweenFights(RootPart, Folder)
+        end
         return
     end
 
@@ -986,6 +1049,29 @@ function Lobby:GetLockReason(DungeonId, Difficulty)
     return nil
 end
 
+-- The last story dungeon that is unlocked, at the chosen difficulty or, when that one is
+-- locked there, the hardest unlocked one below it.
+function Lobby:GetBestChapter()
+    local State = Lobby.State
+    local Names = Lobby.CachedLists.Chapters
+    local Wanted = table.find(Lobby.Difficulties, State.Difficulty) or 1
+    for Index = #Names, 1, -1 do
+        local Name = Names[Index]
+        local ok, Access = Lobby:Invoke("GetDungeonAccessState", Name)
+        if ok and not (type(Access) == "table" and Access.Unlocked == false) then
+            local okDiff, Unlocked = Lobby:Invoke("GetUnlockedDifficulties", Name)
+            for Rank = Wanted, 1, -1 do
+                local Difficulty = Lobby.Difficulties[Rank]
+                local Entry = okDiff and type(Unlocked) == "table" and Unlocked[Difficulty] or nil
+                if not (type(Entry) == "table" and Entry.Unlocked == false) then
+                    return Name, Difficulty
+                end
+            end
+        end
+    end
+    return State.Dungeon, State.Difficulty
+end
+
 --------------------------- [[ Start Run ]] ---------------------------
 
 -- The same calls, in the same order, as the lobby's ENTER button for a solo run:
@@ -1003,6 +1089,10 @@ function Lobby:StartRun()
     end
 
     local DungeonId, Difficulty = State.Dungeon, State.Difficulty
+    if State.Best then
+        State.Status = "looking for the best chapter"
+        DungeonId, Difficulty = Lobby:GetBestChapter()
+    end
     State.Status = ("checking %s (%s)"):format(DungeonId, Difficulty)
 
     local Locked = Lobby:GetLockReason(DungeonId, Difficulty)
@@ -1219,6 +1309,7 @@ function Lobby:RunAccountPass()
     Run(State.Battlepass, "battlepass claims", Lobby.ClaimBattlepass)
     Run(State.EquipBest, "items equipped", Lobby.EquipBest)
     Run(State.Allocate, "stat points spent", Lobby.AllocateStats)
+    Run(BossRush.State.Milestones, "boss rush milestones", BossRush.ClaimMilestones)
 
     State.Status = #Parts > 0 and table.concat(Parts, ", ") or "nothing to do"
     State.Busy, State.Done = false, true
@@ -1416,16 +1507,485 @@ coroutine.wrap(function()
     end
 end)()
 
---------------------------- [[ Auto Start ]] ---------------------------
+--------------------------- [[ Crafting ]] ---------------------------
+
+-- how many times a recipe can be made right now; the game's own Craft Max stops at 100
+function Economy:GetCraftMax(Recipe, Data)
+    local Max = 100
+    local Cost = tonumber(Recipe.CoinCost) or 0
+    if Cost > 0 then
+        local Spendable = math.max((tonumber(Data.Currency) or 0) - Economy.State.CoinReserve, 0)
+        Max = math.min(Max, math.floor(Spendable / Cost))
+    end
+    for _, Material in pairs(type(Recipe.Materials) == "table" and Recipe.Materials or {}) do
+        local Amount = tonumber(Material.Amount) or 0
+        if Amount > 0 then
+            local Source = (Material.Type == "QuestItem" or Material.Id == "Devil Heart") and Data.QuestItems or Data.CraftingMaterials
+            local Owned = type(Source) == "table" and tonumber(Source[Material.Id]) or 0
+            Max = math.min(Max, math.floor(Owned / Amount))
+        end
+    end
+    if Recipe.OutputType == "Equipment" then
+        local Free = (tonumber(Data.MaxInventorySlots) or 60) - (type(Data.EquipmentInventory) == "table" and #Data.EquipmentInventory or 0)
+        Max = math.min(Max, math.max(Free, 0))
+    end
+    return Max
+end
+
+-- Crafts every ticked recipe, as the crafting screen's Craft Max does. Several rounds, so an
+-- ore made in one round can feed the recipe above it in the next.
+function Economy:CraftAll()
+    local Recipes = Economy.CraftingData and Economy.CraftingData.Recipes
+    if type(Recipes) ~= "table" then
+        return 0
+    end
+
+    local Crafted = 0
+    for _ = 1, 6 do
+        local Made = false
+        for _, Id in ipairs(Economy.CachedLists.Recipes) do
+            local Recipe = Economy.State.Recipes[Id] and Recipes[Id]
+            local Data = Recipe and Lobby:GetPlayerData()
+            local Max = Data and Economy:GetCraftMax(Recipe, Data) or 0
+            if Max >= 1 then
+                local ok, Success = Lobby:Call("CraftingService", "Craft", Id, Max)
+                if ok and Success then
+                    Crafted = Crafted + Max * (tonumber(Recipe.Amount) or 1)
+                    Made = true
+                end
+                task.wait(0.6)
+            end
+        end
+        if not Made then
+            break
+        end
+    end
+    return Crafted
+end
+
+--------------------------- [[ Selling ]] ---------------------------
+
+function Economy:IsUnsellable(Item)
+    local Templates = Economy.EquipmentTemplates
+    if Templates == nil or type(Templates.GetTemplate) ~= "function" then
+        return false
+    end
+    local ok, Template = pcall(Templates.GetTemplate, Item.ItemId)
+    return ok and type(Template) == "table" and Template.Unsellable == true
+end
+
+-- Sells the gear of the ticked rarities that is in the inventory: never what is worn, never
+-- what is locked. Returns how many items went and the coins they fetched.
+function Economy:SellGear()
+    local Data = Lobby:GetPlayerData()
+    if Data == nil or type(Data.EquipmentInventory) ~= "table" or next(Economy.State.SellRarities) == nil then
+        return 0, 0
+    end
+
+    local Worn = {}
+    for _, Item in pairs(type(Data.Equipment) == "table" and Data.Equipment or {}) do
+        if type(Item) == "table" and Item.GUID then
+            Worn[Item.GUID] = true
+        end
+    end
+
+    local Guids = {}
+    for _, Item in pairs(Data.EquipmentInventory) do
+        if type(Item) == "table" and Item.GUID and Economy.State.SellRarities[Item.Rarity]
+            and not Item.Locked and not Worn[Item.GUID] and not Economy:IsUnsellable(Item) then
+            table.insert(Guids, Item.GUID)
+        end
+    end
+
+    local Sold, Coins = 0, 0
+    for First = 1, #Guids, 50 do
+        local Batch = table.move(Guids, First, math.min(First + 49, #Guids), 1, {})
+        local ok, Success, Earned = Lobby:Call("ShopService", "SellEquipment", Batch)
+        if ok and Success then
+            Sold = Sold + #Batch
+            Coins = Coins + (tonumber(Earned) or 0)
+        end
+        task.wait(0.6)
+    end
+    return Sold, Coins
+end
+
+--------------------------- [[ Buying ]] ---------------------------
+
+-- Equipment shop: buys a piece of a ticked rarity only when it can be worn now and beats what
+-- is worn in that slot, then puts it on.
+function Economy:BuyGear()
+    if next(Economy.State.GearRarities) == nil then
+        return 0
+    end
+    local ok, Stock = Lobby:Call("ShopService", "GetEquipmentShopInfo")
+    local Data = Lobby:GetPlayerData()
+    if not ok or type(Stock) ~= "table" or Data == nil then
+        return 0
+    end
+
+    local Level = tonumber(Data.PlayerLevel) or 1
+    local Coins = (tonumber(Data.Currency) or 0) - Economy.State.CoinReserve
+    local Free = (tonumber(Data.MaxInventorySlots) or 60) - (type(Data.EquipmentInventory) == "table" and #Data.EquipmentInventory or 0)
+    local Best = {}
+    for Slot, Item in pairs(type(Data.Equipment) == "table" and Data.Equipment or {}) do
+        if type(Item) == "table" and Item.GUID then
+            Best[Slot] = Lobby:ScoreItem(Item)
+        end
+    end
+
+    local Bought = 0
+    for _, Item in pairs(Stock) do
+        if type(Item) == "table" and Item.GUID and Economy.State.GearRarities[Item.Rarity]
+            and Free > 0 and (tonumber(Item.Cost) or math.huge) <= Coins
+            and (tonumber(Item.LevelReq) or 1) <= Level
+            and Lobby:ScoreItem(Item) > (Best[Item.Slot] or -1) then
+            local okBuy, Success = Lobby:Call("ShopService", "BuyEquipment", Item.GUID)
+            if okBuy and Success then
+                Bought = Bought + 1
+                Coins = Coins - Item.Cost
+                Free = Free - 1
+                Best[Item.Slot] = Lobby:ScoreItem(Item)
+            end
+            task.wait(0.6)
+        end
+    end
+    if Bought > 0 then
+        task.wait(0.5)
+        Lobby:EquipBest()
+    end
+    return Bought
+end
+
+-- Mystery Merchant: here for 30 minutes every 2 hours and paid in Stars. While it is away the
+-- server is only asked again once it is due back.
+function Economy:BuyMerchant()
+    local State = Economy.State
+    if next(State.MerchantItems) == nil or os.time() < State.MerchantNext then
+        return 0
+    end
+    local ok, Info = Lobby:Call("MysteryMerchantService", "GetShopInfo")
+    if not ok or type(Info) ~= "table" then
+        return 0
+    end
+
+    local Now = Workspace:GetServerTimeNow()
+    if not Info.Active or Now >= (tonumber(Info.LeavesAt) or 0) then
+        local Wait = (tonumber(Info.NextArrival) or (Now + 300)) - Now
+        State.MerchantNext = os.time() + math.clamp(Wait, 30, 600)
+        return 0
+    end
+
+    local Bought = 0
+    for _, Item in pairs(type(Info.Items) == "table" and Info.Items or {}) do
+        if type(Item) == "table" and State.MerchantItems[Item.Id] then
+            for _ = 1, tonumber(Item.PurchaseLimit) or 1 do
+                local Data = Lobby:GetPlayerData()
+                local Stars = (Data and tonumber(Data.Stars) or 0) - State.StarReserve
+                if Stars < (tonumber(Item.Cost) or math.huge) then
+                    break
+                end
+                local okBuy, Success = Lobby:Call("MysteryMerchantService", "BuyItem", Item.Id, Info.Rotation)
+                if not (okBuy and Success) then
+                    break
+                end
+                Bought = Bought + 1
+                task.wait(0.6)
+            end
+        end
+    end
+    return Bought
+end
+
+--------------------------- [[ Appraisal ]] ---------------------------
+
+-- The gear the appraiser accepts: identified Head, Body and Ring pieces below the player's
+-- level. Returns the labels for the window and the item behind each label.
+function Economy:GetAppraisable()
+    local Labels, Map = {}, {}
+    local Data = Lobby:GetPlayerData()
+    if Data == nil then
+        return Labels, Map
+    end
+
+    local Level = tonumber(Data.PlayerLevel) or 1
+    local Seen = {}
+    for Index, Source in ipairs({ Data.Equipment or {}, Data.EquipmentInventory or {} }) do
+        for _, Item in pairs(type(Source) == "table" and Source or {}) do
+            if type(Item) == "table" and type(Item.GUID) == "string" and not Seen[Item.GUID]
+                and Item.Identified ~= false and Economy.AppraisalCosts[Item.Rarity] ~= nil
+                and (Item.Slot == "Head" or Item.Slot == "Body" or Item.Slot == "Ring")
+                and type(Item.LevelReq) == "number" and Item.LevelReq < Level then
+                Seen[Item.GUID] = true
+                local Label = ("%s%s %s Lv%d (%d Stars) #%s"):format(Index == 1 and "[worn] " or "", tostring(Item.Rarity),
+                    tostring(Item.ItemId), Item.LevelReq, Economy.AppraisalCosts[Item.Rarity], string.sub(Item.GUID, 1, 4))
+                table.insert(Labels, Label)
+                Map[Label] = Item
+            end
+        end
+    end
+    table.sort(Labels)
+    return Labels, Map
+end
+
+-- puts the current list in the window and unticks whatever is no longer on it
+function Economy:RefreshAppraiseList()
+    local State = Economy.State
+    local Labels, Map = Economy:GetAppraisable()
+    State.AppraiseMap = Map
+
+    local Kept, Changed = {}, false
+    for Label in pairs(State.AppraisePicks) do
+        if Map[Label] ~= nil then
+            Kept[Label] = true
+        else
+            Changed = true
+        end
+    end
+
+    Collection:RaiseIdentity()
+    local Dropdown = Collection.UIHandles.AppraiseItems
+    if Dropdown ~= nil then
+        pcall(function()
+            Dropdown:SetValues(Labels)
+            if Changed then
+                Dropdown:SetValue(Kept)
+            end
+        end)
+    end
+end
+
+-- An appraisal rerolls the item's base stats at the player's level, costs Stars and is final,
+-- so only the gear ticked in the window is ever sent.
+function Economy:AppraisePicked()
+    local State = Economy.State
+    local _, Map = Economy:GetAppraisable()
+    local Done = 0
+    for Label in pairs(State.AppraisePicks) do
+        local Item = Map[Label]
+        local Data = Lobby:GetPlayerData()
+        local Stars = (Data and tonumber(Data.Stars) or 0) - State.StarReserve
+        if Item ~= nil and Stars >= Economy.AppraisalCosts[Item.Rarity] then
+            local ok, Result = Lobby:Call("AppraisalService", "AppraiseItem", Item.GUID)
+            if ok and type(Result) == "table" and Result.Success then
+                Done = Done + 1
+            end
+            task.wait(0.6)
+        end
+    end
+    return Done
+end
+
+--------------------------- [[ Economy Pass ]] ---------------------------
+
+-- Everything above that is switched on, in one go: craft, sell, buy, appraise.
+function Economy:RunPass()
+    local State = Economy.State
+    if State.Busy then
+        return State.Status
+    end
+    State.Busy = true
+
+    local Parts = {}
+    local function Run(Enabled, Label, Method)
+        if not Enabled then
+            return
+        end
+        State.Status = Label .. "..."
+        local ok, Count, Extra = pcall(Method, Economy)
+        if not ok then
+            if Debug then warn("[Economy] " .. Label .. " failed:", Count) end
+            table.insert(Parts, Label .. ": error")
+        elseif (tonumber(Count) or 0) > 0 then
+            table.insert(Parts, Extra and ("%s: %d (+%d coins)"):format(Label, Count, Extra) or ("%s: %d"):format(Label, Count))
+        end
+    end
+
+    Run(State.Craft, "crafted", Economy.CraftAll)
+    Run(State.Sell, "sold", Economy.SellGear)
+    Run(State.Buy, "gear bought", Economy.BuyGear)
+    Run(State.Buy, "merchant items bought", Economy.BuyMerchant)
+    Run(State.Appraise, "appraised", Economy.AppraisePicked)
+    pcall(Economy.RefreshAppraiseList, Economy)
+
+    State.Status = #Parts > 0 and table.concat(Parts, ", ") or "nothing to do"
+    State.Busy, State.Done = false, true
+    return State.Status
+end
 
 coroutine.wrap(function()
     while true do
         if Collection.BreakLoop or not Collection:IsAlive() then break end
 
         local ok, err = pcall(function()
+            -- claims and Equip Best go first, so the best gear is already worn when selling starts
+            if not Lobby.AccountState.Done or Lobby.AccountState.Busy then
+                task.wait(1)
+                return
+            end
+
+            local Summary = Economy:RunPass()
+            if Summary ~= "nothing to do" then
+                Collection:Notify({ Title = "Items", Content = tostring(Summary), Duration = 6 })
+            end
+
+            local Deadline = tick() + Economy.State.Interval
+            while tick() < Deadline and Collection:IsAlive() do
+                task.wait(0.5)
+            end
+        end)
+        if err then
+            if Debug then warn("[Economy] Caught Error:", err) end
+            Economy.State.Busy = false
+            task.wait(5)
+        end
+    end
+end)()
+
+--------------------------- [[ Boss Rush ]] ---------------------------
+
+-- Written from the game's BossRushSelectController, BossRushHUDController and
+-- ChestSelectionController. Boss Rush unlocks at player level 67, so none of it has been run.
+
+-- nil when Boss Rush can be entered, otherwise the server's reason
+function BossRush:GetLockReason()
+    local ok, Access = Lobby:Invoke("GetBossRushAccessState")
+    if ok and type(Access) == "table" and Access.Unlocked == false then
+        return tostring(Access.Reason or "Boss Rush is locked")
+    end
+    return nil
+end
+
+-- The same calls as the Boss Rush screen's ENTER button:
+-- mode -> final boss -> skip floor -> RequestEnter.
+function BossRush:StartRun()
+    local State = BossRush.State
+    if State.Busy or Lobby.State.Busy or Lobby.State.Started then
+        return false, "already starting"
+    end
+    State.Busy = true
+
+    local function Finish(ok, Detail)
+        State.Busy, State.Status = false, Detail
+        return ok, Detail
+    end
+
+    State.Status = "checking Boss Rush"
+    local Locked = BossRush:GetLockReason()
+    if Locked ~= nil then
+        return Finish(false, "Boss Rush cannot be entered: " .. Locked)
+    end
+
+    State.Status = ("selecting %s"):format(State.FinalBoss)
+    for _, Step in {
+        { "RequestSelectMode", "BossRush" },
+        { "RequestSelectFinalBoss", State.FinalBoss },
+        { "RequestSelectSkipFloor", State.SkipFloor },
+    } do
+        local ok, Reason = Lobby:Invoke(Step[1], Step[2])
+        if not ok then
+            return Finish(false, ("%s(%s) failed: %s"):format(Step[1], tostring(Step[2]), tostring(Reason)))
+        end
+    end
+
+    State.Status = "entering Boss Rush"
+    local ok, Success, Reason = Lobby:Invoke("RequestEnter")
+    if not (ok and Success) then
+        -- put the lobby's selection back, so a dungeon start is not sent in Boss Rush mode
+        Lobby:Invoke("RequestSelectMode", "Dungeon")
+        return Finish(false, "start refused: " .. tostring(Reason or Success))
+    end
+
+    Lobby.State.Started = true
+    return Finish(true, ("entering Boss Rush (%s)"):format(State.FinalBoss))
+end
+
+-- Claims every milestone the highest floor has reached and that is not claimed yet, once
+-- each: the same call as the rewards panel's Claim button.
+function BossRush:ClaimMilestones()
+    local Milestones = BossRush.Data and BossRush.Data.MILESTONES
+    local Data = Lobby:GetPlayerData()
+    local Progress = Data and Data.BossRush
+    if type(Milestones) ~= "table" or type(Progress) ~= "table" then
+        return 0
+    end
+
+    local Taken = {}
+    for Key, Value in pairs(type(Progress.ClaimedRewards) == "table" and Progress.ClaimedRewards or {}) do
+        Taken[tonumber(Key) or Key] = true
+        Taken[tonumber(Value) or Value] = true
+    end
+
+    local Highest = tonumber(Progress.HighestFloor) or 0
+    local Claimed = 0
+    for Index, Milestone in pairs(Milestones) do
+        if type(Milestone) == "table" and not Taken[Index] and Highest >= (tonumber(Milestone.Floor) or math.huge) then
+            local ok, Success = Lobby:Call("BossRushService", "ClaimMilestoneReward", Index)
+            if ok and Success then
+                Claimed = Claimed + 1
+            end
+            task.wait(0.3)
+        end
+    end
+    return Claimed
+end
+
+-- Where the bosses are. Boss Rush has no Generated_ folder that has been seen, so this looks
+-- for the NPCs folder the enemy system uses, wherever it is, while the player is in a run.
+function BossRush:GetArena()
+    local State = BossRush.State
+    if not LocalPlayer:GetAttribute("InBossRush") then
+        State.Arena = nil
+        return nil
+    end
+
+    local Arena = State.Arena
+    if Arena ~= nil and Arena.Parent ~= nil and Arena:FindFirstChild("NPCs") then
+        return Arena
+    end
+    if tick() - State.LastSearch < 2 then
+        return nil
+    end
+    State.LastSearch = tick()
+
+    local Npcs = Workspace:FindFirstChild("NPCs", true)
+    State.Arena = Npcs and Npcs.Parent or nil
+    return State.Arena
+end
+
+-- What the completion screen's REPLAY and Return to Lobby buttons call in Boss Rush.
+function BossRush:FinishRun()
+    local State = BossRush.State
+    if State.End ~= "Replay" and State.End ~= "Return to lobby" then
+        return
+    end
+    task.wait(Dungeon.Tuning.ReplayDelay)
+    if not Collection:IsAlive() then
+        return
+    end
+
+    local Name = State.End == "Replay" and "RequestReplay" or "RequestReturn"
+    local ok, Reason = Lobby:Call("BossRushService", Name)
+    Collection:Notify({
+        Title = ok and ("Boss Rush: " .. State.End) or "Boss Rush: request failed",
+        Content = ok and "The run is over" or tostring(Reason),
+        Duration = 5,
+    })
+end
+
+--------------------------- [[ Auto Start ]] ---------------------------
+
+-- One loop for both kinds of run: Boss Rush when its Auto start is on, otherwise the dungeon.
+coroutine.wrap(function()
+    while true do
+        if Collection.BreakLoop or not Collection:IsAlive() then break end
+
+        local ok, err = pcall(function()
             local State = Lobby.State
-            if not State.Auto or State.Busy or State.Started then
-                if not State.Auto and not State.Busy and not State.Started then
+            local Rush = BossRush.State
+            local Wanted = State.Auto or Rush.Auto
+            if not Wanted or State.Busy or Rush.Busy or State.Started then
+                if not Wanted and not State.Busy and not Rush.Busy and not State.Started then
                     State.Status = "off"
                 end
                 task.wait(0.5)
@@ -1433,8 +1993,8 @@ coroutine.wrap(function()
             end
 
             -- already inside a run: there is nothing to start
-            if Dungeon:GetFolder() ~= nil then
-                State.Status = "in a dungeon"
+            if Dungeon:GetFolder() ~= nil or LocalPlayer:GetAttribute("InBossRush") then
+                State.Status = "in a run"
                 State.ArrivedAt = tick()
                 task.wait(0.5)
                 return
@@ -1448,6 +2008,14 @@ coroutine.wrap(function()
                 return
             end
 
+            -- crafting, selling and buying are finished before leaving too
+            if not Economy.State.Done or Economy.State.Busy then
+                State.Status = "waiting for crafting and the shops"
+                State.ArrivedAt = tick()
+                task.wait(0.5)
+                return
+            end
+
             -- a run is not started in the middle of spinning for a class
             if Lobby.SpinState.Auto or Lobby.SpinState.Busy then
                 State.Status = "waiting for the class spin to finish"
@@ -1456,19 +2024,28 @@ coroutine.wrap(function()
                 return
             end
 
+            local Target = Rush.Auto and ("Boss Rush (%s)"):format(Rush.FinalBoss)
+                or (State.Best and "the best chapter")
+                or ("%s (%s)"):format(State.Dungeon, State.Difficulty)
             local Left = State.Delay - (tick() - State.ArrivedAt)
             if Left > 0 then
-                State.Status = ("starting %s (%s) in %ds"):format(State.Dungeon, State.Difficulty, math.ceil(Left))
+                State.Status = ("starting %s in %ds"):format(Target, math.ceil(Left))
                 task.wait(0.5)
                 return
             end
 
-            local Started, Detail = Lobby:StartRun()
+            local Started, Detail
+            if Rush.Auto then
+                Started, Detail = BossRush:StartRun()
+                State.Status = tostring(Detail)
+            else
+                Started, Detail = Lobby:StartRun()
+            end
             if not Started then
                 Collection:Notify({ Title = "Lobby", Content = tostring(Detail), Duration = 8 })
                 -- wait out the retry, but stop waiting the moment Auto start is switched off
                 local Deadline = tick() + State.RetryWait
-                while State.Auto and tick() < Deadline and Collection:IsAlive() do
+                while (State.Auto or Rush.Auto) and tick() < Deadline and Collection:IsAlive() do
                     task.wait(0.5)
                 end
             end
@@ -1487,7 +2064,46 @@ end)()
 Lobby.CachedLists = {
     Dungeons = Lobby:GetDungeonNames(),
     Classes  = Lobby:GetClassNames(),
+    Chapters = {},
 }
+
+-- the story dungeons in order, without the side ones (Forest Challenge, Hollow Realm)
+for _, Name in ipairs(Lobby.CachedLists.Dungeons) do
+    local Entry = Lobby.DungeonData and type(Lobby.DungeonData.Dungeons) == "table" and Lobby.DungeonData.Dungeons[Name]
+    if type(Entry) ~= "table" or not (Entry.HideFromSelect or Entry.HollowRealm or Entry.ChallengeMode) then
+        table.insert(Lobby.CachedLists.Chapters, Name)
+    end
+end
+
+Economy.CachedLists = { Recipes = {}, Rarities = {}, MerchantItems = {} }
+for Id in pairs(Economy.CraftingData and type(Economy.CraftingData.Recipes) == "table" and Economy.CraftingData.Recipes or {}) do
+    table.insert(Economy.CachedLists.Recipes, tostring(Id))
+end
+table.sort(Economy.CachedLists.Recipes)
+-- the game's rarity table also carries entries that no gear has
+local NotGear = { Impossible = true, ERROR = true, Admin = true, Owner = true }
+for Rarity in pairs(Collection.RarityIndex) do
+    if not NotGear[Rarity] then
+        table.insert(Economy.CachedLists.Rarities, tostring(Rarity))
+    end
+end
+table.sort(Economy.CachedLists.Rarities, function(A, B)
+    return (tonumber(Collection.RarityIndex[A]) or 0) < (tonumber(Collection.RarityIndex[B]) or 0)
+end)
+for _, Entry in pairs(Economy.MerchantData and type(Economy.MerchantData.Catalog) == "table" and Economy.MerchantData.Catalog or {}) do
+    if type(Entry) == "table" and Entry.Id then
+        table.insert(Economy.CachedLists.MerchantItems, tostring(Entry.Id))
+    end
+end
+table.sort(Economy.CachedLists.MerchantItems)
+
+BossRush.CachedLists = { FinalBosses = {} }
+for _, Name in ipairs(BossRush.Data and type(BossRush.Data.FINAL_BOSS_ORDER) == "table" and BossRush.Data.FINAL_BOSS_ORDER or {}) do
+    table.insert(BossRush.CachedLists.FinalBosses, tostring(Name))
+end
+if #BossRush.CachedLists.FinalBosses == 0 then
+    BossRush.CachedLists.FinalBosses = { "Cursed King" }
+end
 Collection:RaiseIdentity()
 
 Window = Fluent:CreateWindow({
@@ -1506,7 +2122,9 @@ Collection.Tabs = {
     Farm     = Window:AddTab({ Title = "Farming",  Icon = "swords" }),
     Dungeon  = Window:AddTab({ Title = "Dungeon",  Icon = "map" }),
     Lobby    = Window:AddTab({ Title = "Lobby",    Icon = "map" }),
+    BossRush = Window:AddTab({ Title = "Boss Rush", Icon = "map" }),
     Class    = Window:AddTab({ Title = "Class",    Icon = "dices" }),
+    Items    = Window:AddTab({ Title = "Items",    Icon = "map" }),
     Webhook  = Window:AddTab({ Title = "Webhook",  Icon = "bell" }),
     Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
 }
@@ -1684,6 +2302,14 @@ Tabs.Lobby:AddDropdown("Difficulty", {
     end
 end)
 
+Tabs.Lobby:AddToggle("JoinBest", {
+    Title = "Join best chapter",
+    Description = "Ignore the dungeon above and enter the highest one you have unlocked, at the difficulty above or the hardest unlocked one below it",
+    Default = false,
+}):OnChanged(function(Value)
+    Lobby.State.Best = Value
+end)
+
 Tabs.Lobby:AddSlider("StartDelay", {
     Title = "Start delay",
     Description = "Seconds to wait in the lobby before an automatic start",
@@ -1720,6 +2346,108 @@ for _, Entry in {
             Lobby.AccountState[Entry[2]] = Value
         end)
 end
+
+--------------------------- [[ Boss Rush ]] ---------------------------
+
+Collection.UIHandles.BossRushStatus = Tabs.BossRush:AddParagraph({
+    Title = "Status",
+    Content = "off",
+})
+
+coroutine.wrap(function()
+    local Shown
+    while true do
+        task.wait(0.5)
+        if Collection.BreakLoop or not Collection:IsAlive() then break end
+
+        local ok, err = pcall(function()
+            if BossRush.State.Status ~= Shown then
+                Shown = BossRush.State.Status
+                pcall(function() Collection.UIHandles.BossRushStatus:SetDesc(tostring(Shown)) end)
+            end
+        end)
+        if err then
+            if Debug then warn("[Boss Rush Status] Caught Error:", err) end
+            task.wait(1)
+        end
+    end
+end)()
+
+Tabs.BossRush:AddToggle("BossRushAuto", {
+    Title = "Auto start Boss Rush",
+    Description = "Enter Boss Rush instead of a dungeon after arriving in the lobby. Uses the Lobby tab's start delay. Boss Rush unlocks at player level 67",
+    Default = false,
+}):OnChanged(function(Value)
+    BossRush.State.Auto = Value
+end)
+
+Tabs.BossRush:AddDropdown("BossRushFinalBoss", {
+    Title = "Final boss",
+    Values = BossRush.CachedLists.FinalBosses,
+    Multi = false,
+    Default = BossRush.CachedLists.FinalBosses[1],
+}):OnChanged(function(Value)
+    if type(Value) == "string" then
+        BossRush.State.FinalBoss = Value
+    end
+end)
+
+Tabs.BossRush:AddSlider("BossRushSkipFloor", {
+    Title = "Skip to floor",
+    Description = "0 starts at floor 1. Skipping goes in steps of 10 and costs skip tickets",
+    Default = 0,
+    Min = 0,
+    Max = 50,
+    Rounding = 0,
+}):OnChanged(function(Value)
+    BossRush.State.SkipFloor = math.floor((tonumber(Value) or 0) / 10) * 10
+end)
+
+Tabs.BossRush:AddButton({
+    Title = "Start now",
+    Description = "Enter Boss Rush with the final boss above right away",
+    Callback = function()
+        task.spawn(function()
+            local ok, Detail = BossRush:StartRun()
+            Collection:Notify({ Title = "Boss Rush", Content = tostring(Detail), Duration = ok and 5 or 8 })
+        end)
+    end,
+})
+
+Tabs.BossRush:AddToggle("BossRushFight", {
+    Title = "Auto fight the bosses",
+    Description = "Lets Auto Farm fight inside Boss Rush. Auto Farm on the Farming tab has to be on too",
+    Default = true,
+}):OnChanged(function(Value)
+    BossRush.State.Fight = Value
+end)
+
+Tabs.BossRush:AddToggle("BossRushPick", {
+    Title = "Auto pick floor chests",
+    Description = "Take the highest rarity chests on the reward screen between floors",
+    Default = true,
+}):OnChanged(function(Value)
+    BossRush.State.Pick = Value
+end)
+
+Tabs.BossRush:AddDropdown("BossRushEnd", {
+    Title = "When the run ends",
+    Values = { "Stay", "Replay", "Return to lobby" },
+    Multi = false,
+    Default = "Replay",
+}):OnChanged(function(Value)
+    if type(Value) == "string" then
+        BossRush.State.End = Value
+    end
+end)
+
+Tabs.BossRush:AddToggle("BossRushMilestones", {
+    Title = "Claim milestone rewards",
+    Description = "Claim every milestone your highest floor has reached, once each",
+    Default = true,
+}):OnChanged(function(Value)
+    BossRush.State.Milestones = Value
+end)
 
 --------------------------- [[ Class ]] ---------------------------
 
@@ -1795,6 +2523,157 @@ Tabs.Class:AddDropdown("SpinClasses", {
 }):OnChanged(function(Picked)
     if type(Picked) == "table" then
         Lobby.SpinState.Wanted = Picked
+    end
+end)
+
+--------------------------- [[ Items ]] ---------------------------
+
+Collection.UIHandles.ItemStatus = Tabs.Items:AddParagraph({
+    Title = "Status",
+    Content = "waiting",
+})
+
+coroutine.wrap(function()
+    local Shown
+    while true do
+        task.wait(0.5)
+        if Collection.BreakLoop or not Collection:IsAlive() then break end
+
+        local ok, err = pcall(function()
+            if Economy.State.Status ~= Shown then
+                Shown = Economy.State.Status
+                pcall(function() Collection.UIHandles.ItemStatus:SetDesc(tostring(Shown)) end)
+            end
+        end)
+        if err then
+            if Debug then warn("[Item Status] Caught Error:", err) end
+            task.wait(1)
+        end
+    end
+end)()
+
+local CraftSection = Tabs.Items:AddSection("Crafting")
+
+CraftSection:AddToggle("AutoCraft", {
+    Title = "Auto craft",
+    Description = "Craft as many of the ticked recipes as the materials allow",
+    Default = false,
+}):OnChanged(function(Value)
+    Economy.State.Craft = Value
+end)
+
+CraftSection:AddDropdown("CraftRecipes", {
+    Title = "Recipes",
+    Description = "Ore upgrades are free; ingots also cost coins",
+    Values = Economy.CachedLists.Recipes,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(Picked)
+    if type(Picked) == "table" then
+        Economy.State.Recipes = Picked
+    end
+end)
+
+local SellSection = Tabs.Items:AddSection("Selling")
+
+SellSection:AddToggle("AutoSell", {
+    Title = "Auto sell",
+    Description = "Sell inventory gear of the ticked rarities. Worn and locked gear is never sold",
+    Default = false,
+}):OnChanged(function(Value)
+    Economy.State.Sell = Value
+end)
+
+SellSection:AddDropdown("SellRarities", {
+    Title = "Rarities to sell",
+    Values = Economy.CachedLists.Rarities,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(Picked)
+    if type(Picked) == "table" then
+        Economy.State.SellRarities = Picked
+    end
+end)
+
+local BuySection = Tabs.Items:AddSection("Buying")
+
+BuySection:AddToggle("AutoBuy", {
+    Title = "Auto buy",
+    Description = "Buy from the shops ticked below",
+    Default = false,
+}):OnChanged(function(Value)
+    Economy.State.Buy = Value
+end)
+
+BuySection:AddDropdown("BuyGearRarities", {
+    Title = "Equipment shop",
+    Description = "Buy gear of these rarities when you can wear it and it beats what you wear",
+    Values = Economy.CachedLists.Rarities,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(Picked)
+    if type(Picked) == "table" then
+        Economy.State.GearRarities = Picked
+    end
+end)
+
+BuySection:AddDropdown("BuyMerchantItems", {
+    Title = "Mystery Merchant",
+    Description = "Paid in Stars, up to each item's limit, while the merchant is in the lobby",
+    Values = Economy.CachedLists.MerchantItems,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(Picked)
+    if type(Picked) == "table" then
+        Economy.State.MerchantItems = Picked
+    end
+end)
+
+BuySection:AddInput("CoinReserve", {
+    Title = "Keep coins",
+    Description = "Crafting and buying never take your coins below this",
+    Placeholder = "0",
+    Default = "0",
+    Numeric = true,
+    Finished = true,
+}):OnChanged(function(Text)
+    Economy.State.CoinReserve = math.max(tonumber(Text) or 0, 0)
+end)
+
+BuySection:AddInput("StarReserve", {
+    Title = "Keep Stars",
+    Description = "The merchant and appraisals never take your Stars below this",
+    Placeholder = "0",
+    Default = "0",
+    Numeric = true,
+    Finished = true,
+}):OnChanged(function(Text)
+    Economy.State.StarReserve = math.max(tonumber(Text) or 0, 0)
+end)
+
+local AppraiseSection = Tabs.Items:AddSection("Appraisal")
+
+AppraiseSection:AddToggle("AutoAppraise", {
+    Title = "Auto appraise",
+    Description = "Appraise the gear ticked below. It rerolls base stats at your level, costs Stars, is final and can roll lower",
+    Default = false,
+}):OnChanged(function(Value)
+    Economy.State.Appraise = Value
+end)
+
+-- Never saved: the list is the gear that is eligible right now, so the ticks only ever mean
+-- what was chosen in this session.
+Collection.UIHandles.AppraiseItems = AppraiseSection:AddDropdown("AppraiseItems", {
+    Title = "Gear to appraise",
+    Description = "Only gear below your level is listed; it refreshes on every pass",
+    Values = {},
+    Multi = true,
+    Default = {},
+})
+
+Collection.UIHandles.AppraiseItems:OnChanged(function(Picked)
+    if type(Picked) == "table" then
+        Economy.State.AppraisePicks = Picked
     end
 end)
 
@@ -1930,8 +2809,8 @@ function Collection:ReadOptions()
     local Values = {}
     for Id, Option in pairs(Fluent.Options) do
         local Value = Option.Value
-        if Id == "AutoSpin" then
-            -- see the Class section: Auto Spin always starts switched off
+        if Id == "AutoSpin" or Id == "AppraiseItems" then
+            -- Auto Spin always starts switched off, and the appraisal ticks belong to one session
             Value = nil
         end
         if type(Value) == "table" then
@@ -2108,6 +2987,9 @@ Collection:Track(Dungeon.RunEvents.ReplayStarting.OnClientEvent:Connect(function
 end))
 
 Collection:Track(Dungeon.RunEvents.DungeonComplete.OnClientEvent:Connect(function(Data)
+    if LocalPlayer:GetAttribute("InBossRush") then
+        return
+    end
     Dungeon.State.Cleared = true
     -- sent first: the replay that follows teleports away and takes this script with it
     if Collection.WebhookState.On then
@@ -2120,6 +3002,26 @@ Collection:Track(Dungeon.RunEvents.DungeonComplete.OnClientEvent:Connect(functio
     end
     Dungeon:FinishRun()
 end))
+
+-- Boss Rush: the reward screen between floors and the end of the run
+if BossRush.Events ~= nil then
+    local FloorChests = BossRush.Events:FindFirstChild("ChestSelection")
+    if FloorChests ~= nil then
+        Collection:Track(FloorChests.OnClientEvent:Connect(function(Chests, OwnsExtraLoot)
+            local SelectRemote = BossRush.Service.RF:FindFirstChild("SelectFloorChests")
+            if SelectRemote ~= nil then
+                Dungeon:PickChests(Chests, OwnsExtraLoot, SelectRemote, BossRush.State.Pick)
+            end
+        end))
+    end
+
+    local RushComplete = BossRush.Events:FindFirstChild("DungeonComplete")
+    if RushComplete ~= nil then
+        Collection:Track(RushComplete.OnClientEvent:Connect(function()
+            BossRush:FinishRun()
+        end))
+    end
+end
 
 -- A reward or completion screen that was already up when this script loaded has sent its event
 -- too. Chests clicked by hand on that screen were never sent to the server.
