@@ -257,8 +257,18 @@ local function zoneUnlocked(name)
     local rebirths = (Live.Rebirths or 0) + (Live.BonusRebirths or 0)
     return rebirths >= (worldConfig().Practice.ZoneRequiredRebirths[name] or math.huge)
 end
+-- Short names for the dropdown and status: "TrainingZone_LegendaryCelestial" -> "Legendary Celestial".
+local function zoneLabel(name)
+    if name == "TrainingZone" then return "Basic" end
+    local label = name:gsub("^TrainingZone_", ""):gsub("_EVENT$", " (Event)"):gsub("(%l)(%u)", "%1 %2")
+    return label
+end
 local function pickZone()
-    if State.TrainZone ~= "Best Unlocked" then return State.TrainZone end
+    if State.TrainZone ~= "Best Unlocked" then
+        for _, name in ipairs(zoneNames()) do
+            if zoneLabel(name) == State.TrainZone then return name end
+        end
+    end
     for _, name in ipairs(zoneNames()) do
         if zoneUnlocked(name) then return name end
     end
@@ -608,7 +618,7 @@ FarmSection:AddSlider("SmartWindow", {
     Callback = function(value) State.SmartWindow = value end,
 })
 local zoneValues = { "Best Unlocked" }
-for _, name in ipairs(zoneNames()) do table.insert(zoneValues, name) end
+for _, name in ipairs(zoneNames()) do table.insert(zoneValues, zoneLabel(name)) end
 FarmSection:AddDropdown("TrainZone", {
     Title = "Training Zone", Values = zoneValues, Default = "Best Unlocked", Multi = false,
     Description = "Best Unlocked follows new unlocks and event zones automatically.",
@@ -1155,10 +1165,10 @@ loop(2, function()
     announce("world", world, "Now in " .. world .. ". Zones, eggs and stones switched to this world.")
 
     local _, highest = WorldUnlocks.Highest(Live)
-    announce("highestWorld", highest, "Unlocked " .. tostring(highest) .. "!" .. (State.AutoWorld and " Travelling there now." or " Use Next World Now or turn on Auto Next World."))
+    announce("highestWorld", highest, "Unlocked " .. tostring(highest) .. "!" .. (State.AutoWorld and " Travelling there now." or " Turn on Auto Next World to go there."))
 
     local zone = pickZone()
-    announce("zone", zone, "New best training zone: " .. zone .. ".")
+    announce("zone", zone, "New best training zone: " .. zoneLabel(zone) .. ".")
 
     local egg = pickEgg()
     announce("egg", egg, "New best egg you can afford: " .. tostring(egg))
@@ -1188,7 +1198,7 @@ loop(1, function()
         "Activity: " .. activity() .. "   Farm: " .. farm,
         "Wins: " .. stat("Wins") .. "   Skill: " .. stat("Skill") .. "   Rebirths: " .. stat("Rebirths") .. "   " .. worldId(),
         string.format("Level: %s   Next rebirth: %s%s", tostring(Live.Level), tostring(Live.NextRebirthLevel), paused),
-        string.format("Throw: ~%sm -> %s (%s wins)   Zone: %s", compact(math.floor(distance)), zone and zone.Name or "-", compact(zone and zone.Wins or 0), pickZone()),
+        string.format("Throw: ~%sm -> %s (%s wins)   Zone: %s", compact(math.floor(distance)), zone and zone.Name or "-", compact(zone and zone.Wins or 0), zoneLabel(pickZone())),
         string.format("Session: %d throws, %s wins (%s/min), %d hatches", Session.Throws, compact(Session.Wins), compact(math.floor(Session.Wins / minutes)), Session.Hatches),
     }, "\n"))
     EggStatus:SetDesc("Next hatch: " .. eggStatus() .. "\nHatched this session: " .. Session.Hatches)
