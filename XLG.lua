@@ -18,6 +18,7 @@ local Shop = {}
 local Units = {}
 local Macro = {}
 local Profile = {} -- config save/load, filled in under [[ Config ]]
+local Challenge = {}
 
 local Services = setmetatable({}, {
     __index = function(_, k)
@@ -211,6 +212,7 @@ do
         CapsuleData = { "Data", "CapsuleData" },
         CalculateUnitsStats = { "CalculateUnitsStats" },
         GameplayMapConfig = { "Gameplay", "MapConfig" }, -- match place: map key -> name
+        ChallangeData = { "Data", "ChallangeData" }, -- (sic) reset length of each challenge
     }) do
         -- only lobby modules are worth waiting for in the lobby; match-only ones would just time out
         local Wait = Collection.InLobby and Key ~= "GameplayMapConfig"
@@ -285,7 +287,7 @@ end
 
 --------------------------- [[ Play ]] ---------------------------
 
-Play.Modes = { "Story", "Raids", "Mysterios", "Infinite", "Event", "Challenge" } -- "Mysterios" is the game's spelling
+Play.Modes = { "Story", "Raids", "Mysterios", "Infinite", "Event" } -- "Mysterios" is the game's spelling
 Play.ChallengeKinds = { "Daily", "Weekly", "Regular" }
 Play.Difficulties = { "Normal", "Hard", "Nightmare" }
 
@@ -440,33 +442,8 @@ function Play:Resolve()
     local Options = Collection.Options
     local Mode = Options.PlayMode.Value
 
-    if Mode == "Challenge" then
-        local Kind = Options.PlayMap.Value
-        local Data = self:GetChallenges()
-        local Challenge = Kind and Data and Data[Kind]
-        if not Challenge then
-            return nil, "no " .. tostring(Kind) .. " challenge data"
-        end
-
-        local Rewards = { Items = {} }
-        for _, Reward in ipairs(Challenge.Rewards or {}) do
-            if Reward.Id == "Coins" then
-                Rewards.Coins = Reward.Amount
-            elseif Reward.Id == "Gems" then
-                Rewards.Gems = Reward.Amount
-            else
-                table.insert(Rewards.Items, { Chance = 100, Id = Reward.Id, Count = Reward.Amount })
-            end
-        end
-
-        return {
-            Mode = Kind .. "Challenge",
-            MapToCreate = Challenge.MapToCreate,
-            MapName = Kind .. " Challenge",
-            Stage = Challenge.StageName,
-            Difficulty = "Nightmare",
-            Rewards = Rewards,
-        }
+    if Mode == "Challenge" then -- an older saved setting; challenges have their own tab now
+        return nil, "Challenges moved to the Challenge tab - pick a Play mode"
     end
 
     local Map = self:FindMap(Mode, Options.PlayMap.Value)
@@ -511,6 +488,183 @@ function Play:Describe(Selection)
     return ("%s - %s stage %s (%s)"):format(Selection.Mode, Selection.MapName, tostring(Selection.Stage), Selection.Difficulty)
 end
 
+--------------------------- [[ Challenge ]] ---------------------------
+
+-- Daily / Weekly / Regular challenges run on their own schedule next to Play. Each resets on a fixed
+-- clock (ChallangeData Duration: Regular 1800s = 30 min, Daily a day, Weekly a week); clearing one
+-- stores that reset's index in Data.ClearedChallenges[Kind]. The lobby starts them, the match sends
+-- you back to the lobby afterwards, and Play carries on from there.
+Challenge.Kinds = { "Weekly", "Daily", "Regular" } -- the rarer one first when several are up
+Challenge.Durations = { Weekly = 604800, Daily = 86400, Regular = 1800 }
+Challenge.SessionFile = Collection.Folder .. "/Session_" .. LocalPlayer.Name .. ".json"
+
+function Challenge:Duration(Kind)
+    local Info = Collection.Modules.ChallangeData and Collection.Modules.ChallangeData[Kind]
+    return Info and tonumber(Info.Duration) or self.Durations[Kind]
+end
+
+function Challenge:Period(Kind)
+    return math.floor(os.time() / self:Duration(Kind))
+end
+
+function Challenge:SecondsLeft(Kind)
+    local Duration = self:Duration(Kind)
+    return Duration - os.time() % Duration
+end
+
+function Challenge:Cleared(Kind)
+    local Data = Collection:GetData()
+    local Done = Data and Data.ClearedChallenges and tonumber(Data.ClearedChallenges[Kind]) or 0
+    return self:Period(Kind) <= Done
+end
+
+-- Shared by the lobby and the match (same account): tries per reset, which upcoming challenges
+-- the lobby found unlocked, and what was last started.
+function Challenge:Session()
+    if not self.SessionCache or os.clock() - (self.SessionAt or 0) > 2 then
+        local Saved = Collection:ReadJson(self.SessionFile)
+        self.SessionCache = type(Saved) == "table" and Saved or {}
+        self.SessionAt = os.clock()
+    end
+    return self.SessionCache
+end
+
+function Challenge:SaveSession(Session)
+    self.SessionCache, self.SessionAt = Session, os.clock()
+    Collection:WriteJson(self.SessionFile, Session)
+end
+
+function Challenge:Key(Kind, Offset)
+    return Kind .. ":" .. (self:Period(Kind) + (Offset or 0))
+end
+
+function Challenge:Tries(Kind)
+    return tonumber((self:Session().Tries or {})[self:Key(Kind)]) or 0
+end
+
+function Challenge:AddTry(Kind)
+    local Session = self:Session()
+    local Tries = {}
+    for _, Each in ipairs(self.Kinds) do -- drop counts from earlier resets
+        local Key = self:Key(Each)
+        Tries[Key] = (Session.Tries or {})[Key]
+    end
+    Tries[self:Key(Kind)] = (Tries[self:Key(Kind)] or 0) + 1
+    Session.Tries = Tries
+    self:SaveSession(Session)
+end
+
+-- Lobby: room settings for a challenge, built like the game's challenge card does it.
+function Challenge:Selection(Kind)
+    local Data = Play:GetChallenges()
+    local Info = Data and Data[Kind]
+    if not Info then return nil, "no " .. Kind .. " challenge data" end
+    local Rewards = { Items = {} }
+    for _, Reward in ipairs(Info.Rewards or {}) do
+        if Reward.Id == "Coins" then
+            Rewards.Coins = Reward.Amount
+        elseif Reward.Id == "Gems" then
+            Rewards.Gems = Reward.Amount
+        else
+            table.insert(Rewards.Items, { Chance = 100, Id = Reward.Id, Count = Reward.Amount })
+        end
+    end
+    return {
+        Mode = Kind .. "Challenge",
+        MapToCreate = Info.MapToCreate,
+        MapName = ("%s Challenge (%s)"):format(Kind, tostring(Info.MapName)),
+        Stage = Info.StageName,
+        Difficulty = "Nightmare",
+        Rewards = Rewards,
+        ChallengeKind = Kind,
+    }
+end
+
+-- Lobby: is this map/stage unlocked, ignoring whether this reset's challenge is already cleared.
+function Challenge:Unlocked(MapToCreate, Stage, Kind)
+    local Data = Collection:GetData()
+    if not (Data and Play.Unlock) then return true end
+    local Fresh = setmetatable({ ClearedChallenges = {} }, { __index = Data })
+    local ok, Allowed, Reason = pcall(Play.Unlock.CheckPlay, Fresh, MapToCreate, Stage, Kind .. "Challenge")
+    if not ok then return true end
+    return Allowed == true, Reason
+end
+
+-- Why a picked challenge can't run right now, or nil when it can. A match can't check unlocks,
+-- so it uses what the lobby worked out for this reset's challenge (Playable).
+function Challenge:Block(Kind)
+    if not Collection.Options.ChallengePick.Value[Kind] then return "off" end
+    if self:Cleared(Kind) then
+        return "done, resets in " .. Collection:FormatTime(self:SecondsLeft(Kind))
+    end
+    local Tries = self:Tries(Kind)
+    if Tries >= Collection.Options.ChallengeTries.Value then
+        return ("lost %d tries, resets in %s"):format(Tries, Collection:FormatTime(self:SecondsLeft(Kind)))
+    end
+    if Collection.InLobby then
+        local Selection, Why = self:Selection(Kind)
+        if not Selection then return Why end
+        local Unlocked, Reason = self:Unlocked(Selection.MapToCreate, Selection.Stage, Kind)
+        if not Unlocked then return "locked: " .. tostring(Reason) end
+    elseif (self:Session().Playable or {})[self:Key(Kind)] == false then
+        return "locked"
+    end
+    return nil
+end
+
+-- The challenge to run next: (Selection, Kind) in the lobby, (true, Kind) in a match, or nil.
+function Challenge:Next()
+    if not Collection.Options.AutoChallenge.Value then return nil end
+    for _, Kind in ipairs(self.Kinds) do
+        if not self:Block(Kind) then
+            if Collection.InLobby then
+                return self:Selection(Kind), Kind
+            end
+            return true, Kind
+        end
+    end
+    return nil
+end
+
+-- Lobby, every 30s: which challenge each kind rolls this reset and next (the game picks them from
+-- the clock), and whether it's unlocked; a match reads that to decide if it's worth leaving.
+function Challenge:RememberUnlocks()
+    if not (Play.Unlock and Play.Unlock.GetChallenge) then return end
+    local Session = self:Session()
+    local Playable = {}
+    for _, Kind in ipairs(self.Kinds) do
+        for Offset = 0, 1 do
+            local ok, Pick = pcall(Play.Unlock.GetChallenge, Kind, Offset)
+            if ok and type(Pick) == "table" then
+                Playable[self:Key(Kind, Offset)] = (self:Unlocked(Pick.MapToCreate, Pick.Stage, Kind))
+            end
+        end
+    end
+    Session.Playable = Playable
+    self:SaveSession(Session)
+end
+
+function Challenge:Describe()
+    local Data = Collection.InLobby and Play:GetChallenges() or nil
+    local Lines = {}
+    for _, Kind in ipairs({ "Regular", "Daily", "Weekly" }) do
+        local Info = Data and Data[Kind]
+        local Where = Info and (" - %s stage %s"):format(tostring(Info.MapName), tostring(Info.StageName)) or ""
+        table.insert(Lines, ("%s%s: %s"):format(Kind, Where, self:Block(Kind) or "ready"))
+    end
+    if not Collection.Options.AutoChallenge.Value then
+        table.insert(Lines, "Auto challenge is off")
+    end
+    return table.concat(Lines, "\n")
+end
+
+function Challenge:Refresh()
+    if Collection.InLobby and Collection:Due("ChallengeUnlocks", 30) then
+        pcall(self.RememberUnlocks, self)
+    end
+    Collection:SetPara("ChallengeStatus", self:Describe())
+end
+
 --------------------------- [[ Party ]] ---------------------------
 
 Party.MaxPlayers = 5
@@ -543,7 +697,11 @@ function Party:Role()
     if Options.PartyEnabled.Value and Host ~= nil and Host ~= "" then
         return Host == LocalPlayer.Name and "Host" or "Member"
     end
-    return Options.AutoJoin.Value and "Solo" or "Off"
+    -- a due challenge runs a room even with Auto join off
+    if Options.AutoJoin.Value or Challenge:Next() then
+        return "Solo"
+    end
+    return "Off"
 end
 
 function Party:RoomNames()
@@ -603,7 +761,13 @@ function Party:Host()
     local Remotes = Collection.Remotes
     local Solo = self:Role() == "Solo"
     local Who = Solo and "Auto join" or "Host"
-    local Selection, Why = Play:Resolve()
+    -- a due challenge goes first; Play's pick resumes once it's done
+    local Selection, Why = Challenge:Next()
+    if Selection then
+        Who = Selection.ChallengeKind .. " challenge"
+    else
+        Selection, Why = Play:Resolve()
+    end
     if not Selection then
         return self:SetStatus(Who .. ": " .. Why)
     end
@@ -694,6 +858,9 @@ function Party:Host()
 
     self.ForceStart = false
     self.StartedAt = os.clock()
+    local Session = Challenge:Session()
+    Session.Last = { Kind = Selection.ChallengeKind and "Challenge" or "Play", Type = Selection.ChallengeKind, At = os.time() }
+    Challenge:SaveSession(Session)
     Remotes.TeleportRequest:FireServer(Collection.MatchPlace, Selection.Mode, Selection.MapToCreate, Selection.Stage, Selection.Difficulty)
     self:SetStatus(Summary .. " | start sent")
 end
@@ -1995,6 +2162,28 @@ function Match:MaxUpgrade(Model)
     return Info and Info.MaxUpgradeLevel or 5
 end
 
+-- The lobby hands every match its mode in the teleport data (the game's MainClient reads the same
+-- GameMode); "RegularChallenge" / "DailyChallenge" / "WeeklyChallenge" are the challenges.
+function Match:GameMode()
+    if self.Mode == nil then
+        local ok, Data = pcall(function()
+            return Services.TeleportService:GetLocalPlayerTeleportData()
+        end)
+        self.Mode = ok and type(Data) == "table" and tostring(Data.GameMode or "") or ""
+        if self.Mode == "" then -- no teleport data: trust what the lobby said it started
+            local Last = Challenge:Session().Last
+            if type(Last) == "table" and Last.Kind == "Challenge" and os.time() - (Last.At or 0) < 7200 then
+                self.Mode = tostring(Last.Type) .. "Challenge"
+            end
+        end
+    end
+    return self.Mode
+end
+
+function Match:ChallengeKind()
+    return self:GameMode():match("^(%a+)Challenge$")
+end
+
 function Match:OnStart()
     self.Ended = false
     self.StartSim = self:Sim()
@@ -2004,6 +2193,21 @@ function Match:OnStart()
     self.WatchedFolder = nil
     self:WatchField()
     Macro:OnMatchStart()
+    if self:ChallengeKind() then
+        Challenge:AddTry(self:ChallengeKind())
+    end
+end
+
+-- Forfeits a running match first (the game's own Leave flow), then goes back to the lobby.
+function Match:ReturnToLobby()
+    if Collection.InLobby then return end
+    self.Leaving = true
+    if self:Started() then
+        self:Fire("ForceEndGameRequest", "Lose")
+        Collection:WaitFor(function() return self.Ended or self:OnEndScreen() end, 10)
+        task.wait(1)
+    end
+    self:Fire("LeaveGameRequest")
 end
 
 -- EndGameEvent: won, map key, stage, seconds, per-unit EXP rows, can-next, rewards, difficulty, stats
@@ -2024,6 +2228,20 @@ function Match:OnEnd(Won, Map, Stage, Seconds, ExpRows, _, Rewards, Difficulty, 
     end
 
     local Action = Collection.Options.AfterMatch.Value or "Nothing"
+    local Kind = self:ChallengeKind()
+    if self.Leaving then
+        return -- Return to Lobby is already on its way out
+    elseif Kind then
+        -- a challenge runs once per reset: back to the lobby, where Play picks up again
+        Action = "Back to lobby"
+        self.ChallengeNote = Kind .. " challenge " .. (Won and "cleared" or "lost") .. " - back to the lobby"
+    else
+        local Due, DueKind = Challenge:Next()
+        if Due and Collection.Options.ChallengeLeave.Value then
+            Action = "Back to lobby"
+            self.ChallengeNote = DueKind .. " challenge is up - back to the lobby to run it"
+        end
+    end
     if Action == "Nothing" then return end
     task.delay(3, function() -- same pause the game's own auto retry uses
         if not Collection:IsAlive() then return end
@@ -2050,6 +2268,19 @@ function Match:Step()
         self.Ended = false
     end
     local Started = self:Started()
+
+    if Collection:Due("ChallengeView", 2) then
+        Challenge:Refresh()
+        -- "Don't wait": forfeit a non-challenge match as soon as a challenge is up
+        if Started and not self:ChallengeKind() and not self.Leaving
+            and Options.ChallengeLeave.Value and Options.ChallengeLeaveNow.Value then
+            local Due, DueKind = Challenge:Next()
+            if Due then
+                self.ChallengeNote = DueKind .. " challenge is up - leaving this match for it"
+                task.spawn(self.ReturnToLobby, self)
+            end
+        end
+    end
 
     if Options.AutoVoteStart.Value and Voting
         and LocalPlayer:GetAttribute("HasVotedStart") ~= true and Collection:Due("VoteStart", 2) then
@@ -2101,7 +2332,9 @@ function Match:Step()
     if Collection:Due("TeamText", 5) or not self.Team then
         self.Team = self:TeamText()
     end
-    Collection:SetPara("MatchStatus", Status .. "\n" .. self.Team)
+    local Kind = self:ChallengeKind()
+    local Note = self.ChallengeNote or (Kind and (Kind .. " challenge match - back to the lobby when it ends"))
+    Collection:SetPara("MatchStatus", Status .. "\n" .. self.Team .. (Note and ("\n" .. Note) or ""))
     return 0.25
 end
 
@@ -4475,7 +4708,7 @@ end
 do
     Collection.Tabs = {}
     local Lobby = Collection:AddFolder("Lobby")
-    for _, Name in ipairs({ "Party", "Play", "Summon", "Units", "Missions", "Shop" }) do
+    for _, Name in ipairs({ "Party", "Play", "Challenge", "Summon", "Units", "Missions", "Shop" }) do
         Collection.Tabs[Name] = Lobby:AddTab({ Title = Name })
     end
     local InGame = Collection:AddFolder("In-Game")
@@ -4661,6 +4894,53 @@ do
         Description = "Challenges are always Nightmare",
         Values = Play.Difficulties,
         Default = "Normal",
+    })
+end
+
+--------------------------- [[ Challenge Tab ]] ---------------------------
+
+do
+    local Tab = Collection.Tabs.Challenge
+
+    Collection.UI.ChallengeStatus = Tab:AddParagraph({ Title = "Challenges", Content = "-" })
+
+    local Main = Tab:AddSection("Auto challenge")
+
+    Main:AddToggle("AutoChallenge", {
+        Title = "Auto challenge",
+        Description = "Plays each picked challenge once per reset, then goes back to whatever Play is set to (e.g. an Event). Works with or without Auto join.",
+        Default = false,
+    })
+
+    Main:AddDropdown("ChallengePick", {
+        Title = "Challenges",
+        Description = "Regular resets every 30 minutes, Daily every day, Weekly every week",
+        Values = { "Regular", "Daily", "Weekly" },
+        Multi = true,
+        Default = { "Regular", "Daily", "Weekly" },
+    })
+
+    Main:AddSlider("ChallengeTries", {
+        Title = "Tries per reset",
+        Description = "A challenge you keep losing is skipped until it resets",
+        Min = 1,
+        Max = 5,
+        Default = 2,
+        Rounding = 0,
+    })
+
+    local Leave = Tab:AddSection("Leaving other matches")
+
+    Leave:AddToggle("ChallengeLeave", {
+        Title = "Return to lobby for a challenge",
+        Description = "When a challenge resets while you're in another match, go back to the lobby when that match ends, run the challenge, then Play takes you back.",
+        Default = true,
+    })
+
+    Leave:AddToggle("ChallengeLeaveNow", {
+        Title = "Don't wait for the match to end",
+        Description = "Forfeits the current match (a loss) to start the challenge right away",
+        Default = false,
     })
 end
 
@@ -4903,9 +5183,21 @@ do
 
     After:AddDropdown("AfterMatch", {
         Title = "When it ends",
-        Description = "Back to lobby pairs with Play > Auto join",
+        Description = "Back to lobby pairs with Play > Auto join. Challenge matches always go back to the lobby.",
         Values = { "Nothing", "Retry", "Next stage (retry if lost)", "Back to lobby" },
         Default = "Nothing",
+    })
+
+    After:AddButton({
+        Title = "Return to Lobby",
+        Description = "Leaves now. During a match this forfeits it first (counts as a loss).",
+        Callback = function()
+            if Collection.InLobby then
+                Collection.Library:Notify({ Title = "vaderhug", Content = "You're already in the lobby", Duration = 3 })
+                return
+            end
+            task.spawn(Match.ReturnToLobby, Match)
+        end,
     })
 
     local Dev = Tab:AddSection("Developer")
@@ -5595,6 +5887,9 @@ coroutine.wrap(function()
     while Collection:IsAlive() do
         local ok, err = pcall(function()
             Party:Tick()
+            if Collection:Due("ChallengeView", 2) then
+                Challenge:Refresh()
+            end
 
             local Selection, Why = Play:Resolve()
             local Text
@@ -5603,6 +5898,10 @@ coroutine.wrap(function()
                 Text = Play:Describe(Selection) .. (Allowed and "" or ("\nlocked: " .. tostring(Reason)))
             else
                 Text = tostring(Why)
+            end
+            local Due = Challenge:Next()
+            if Due then
+                Text = "First: " .. Play:Describe(Due) .. "\nThen: " .. Text
             end
             if Text ~= Collection.PlayInfoText then
                 Collection.PlayInfoText = Text
@@ -5658,7 +5957,7 @@ pcall(Match.ShowSpawnOrder, Match)
 
 -- handle for debugging from another script
 GlobalEnv.vaderhug_animemys = {
-    Collection = Collection, Party = Party, Play = Play, Match = Match, Macro = Macro,
+    Collection = Collection, Party = Party, Play = Play, Match = Match, Macro = Macro, Challenge = Challenge,
     Summon = Summon, Claim = Claim, Shop = Shop, Units = Units, Library = Library, Window = Window,
 }
 
