@@ -26,7 +26,7 @@ local State = {
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {},
 	AutoAbility = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	-- auto play
-	AutoPlace = false, ShowPlacePoint = true, PlaceBeforeUpgrade = true,
+	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true,
 	Slots = {}, -- slot id -> { On, Mode, Percent, Max }
 	-- summon
 	AutoSummon = false, Banner = nil, SummonPay = "Gems x10", KeepGems = 0,
@@ -98,7 +98,8 @@ local Data = Collection:ModuleTable(Loader.load_data)
 local Core = Collection:ModuleTable(Loader.load_core_service)
 local Client = Collection:ModuleTable(Loader.load_client_service)
 
-while not Client.EndpointsClient.session do task.wait(0.5) end
+-- from autoexec this can run before the game has registered its client services; keep asking until it has
+while not (Client.EndpointsClient and Client.EndpointsClient.session) do task.wait(0.5) end
 local session = Client.EndpointsClient.session
 local toServer = ReplicatedStorage.endpoints.client_to_server
 local fromServer = ReplicatedStorage.endpoints.server_to_client
@@ -785,11 +786,21 @@ PlaceSection:AddToggle("AutoPlace", {
 	Description = "Places the slots that are on around each slot's own point: one of each unit, then second copies, and so on, slot order breaking ties. Waits for money, and pauses while Play Macro is on.",
 	Callback = function(value) State.AutoPlace = value end,
 })
+PlaceSection:AddToggle("ShowHolograms", {
+	Title = "Show Holograms", Default = true,
+	Description = "See-through copies of your units on the exact spots Auto Place will use, in order, tagged slot·copy. On your screen only.",
+	Callback = function(value) State.ShowHolograms = value end,
+})
 PlaceSection:AddToggle("ShowPlacePoint", {
 	Title = "Show Placement Points", Default = true,
 	Description = "A numbered glowing ball at each slot's point, on your screen only.",
 	Callback = function(value) State.ShowPlacePoint = value end,
 })
+
+-- where a unit can stand, for slot titles and the status
+function Collection:PlacementTag(data)
+	return data.hill_unit and " (hill)" or (data.hybrid_placement and " (hill or ground)" or "")
+end
 
 -- one section per team slot; positions are saved per map and slot
 function Collection:SetSlotPosition(slot)
@@ -808,7 +819,8 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 	local equipped = session.profile_data.collection.equipped_units
 	local u = Collection:Owned()[equipped[slot] or equipped[tonumber(slot)] or ""]
 	local cap = u and Data.Units[u.unit_id] and Data.Units[u.unit_id].spawn_cap
-	local section = Tabs.AutoPlay:AddSection("Slot " .. slot .. " - " .. (u and Collection:UnitName(u) or "empty"))
+	local section = Tabs.AutoPlay:AddSection("Slot " .. slot .. " - "
+		.. (u and (Collection:UnitName(u) .. Collection:PlacementTag(Data.Units[u.unit_id] or {})) or "empty"))
 	section:AddToggle("Slot" .. slot .. "Place", {
 		Title = "Place This Slot", Default = true,
 		Callback = function(value) cfg.On = value end,
@@ -1704,23 +1716,26 @@ function Collection:PlaceAnchor(slot)
 	return position, cfg.Percent .. "% of the path"
 end
 
--- the game lifts a placement by half the unit model's height
+-- the game lifts a placement by half the unit model's height. Read from the stored template: building a model
+-- with get_unit_model runs the unit's setup script on this thread, which strips the executor's permissions.
 local unitHalfHeight = {}
 function Collection:UnitHalfHeight(unitId)
 	if not unitHalfHeight[unitId] then
-		local ok, model = pcall(Core.UnitServiceCore.get_unit_model, unitId)
-		unitHalfHeight[unitId] = ok and model and model.PrimaryPart and model.PrimaryPart.Size.Y / 2 or 1.5
-		if ok and typeof(model) == "Instance" then model:Destroy() end
+		local chars, data = Core.UnitServiceCore.unit_chars or {}, Data.Units[unitId] or {}
+		local model = chars[unitId] or (data.evolved and chars[data.evolved.from])
+		local root = model and (model.PrimaryPart or model:FindFirstChild("HumanoidRootPart"))
+		unitHalfHeight[unitId] = root and root.Size.Y / 2 or 1
 	end
 	return unitHalfHeight[unitId]
 end
 
--- ground (or hill) the game accepts at x, z, off the road and clear of other units' hitboxes; mirrors PlacementCore
+-- ground (or hill) the game accepts at x, z, off the road and clear of other units' hitboxes (and of reserved
+-- { pos, radius } spots, used to lay out holograms); mirrors PlacementCore
 local placeRay = RaycastParams.new()
 placeRay.FilterType = Enum.RaycastFilterType.Include
 local roadOverlap = OverlapParams.new()
 roadOverlap.FilterType = Enum.RaycastFilterType.Include
-function Collection:PlacementSpot(data, x, y, z, radius)
+function Collection:PlacementSpot(data, x, y, z, radius, reserved)
 	local terrain = workspace:FindFirstChild("_terrain")
 	if not terrain then return nil end
 	placeRay.FilterDescendantsInstances = { terrain }
@@ -1747,12 +1762,44 @@ function Collection:PlacementSpot(data, x, y, z, radius)
 			return nil
 		end
 	end
+	for _, r in reserved or {} do
+		if Vector2.new(r.pos.X - hit.Position.X, r.pos.Z - hit.Position.Z).Magnitude < radius + r.radius then return nil end
+	end
 	return hit.Position
 end
 
--- the nearest free spot around the anchor: rings 3 studs apart, out to 30 studs; bad holds spots the server refused
-function Collection:FindSpot(data, anchor, bad)
+-- points 3 studs apart across the tops of the map's hill parts, nearest to the anchor first
+function Collection:HillPoints(anchor)
+	local hill = workspace:FindFirstChild("_terrain") and workspace._terrain:FindFirstChild("hill")
+	local points = {}
+	for _, part in hill and hill:GetDescendants() or {} do
+		if part:IsA("BasePart") then
+			local size = part.Size
+			for x = -size.X / 2 + 1.5, size.X / 2 - 1.5, 3 do
+				for z = -size.Z / 2 + 1.5, size.Z / 2 - 1.5, 3 do
+					table.insert(points, part.CFrame * Vector3.new(x, size.Y / 2, z))
+				end
+			end
+		end
+	end
+	table.sort(points, function(a, b) return (a - anchor).Magnitude < (b - anchor).Magnitude end)
+	return points
+end
+
+-- the nearest free spot around the anchor: rings 3 studs apart, out to 30 studs. Hill units can only stand on hills,
+-- so they search the hill parts instead, wherever those are. bad holds spots the server refused
+function Collection:FindSpot(data, anchor, bad, reserved)
 	local radius = data.override_hitbox_radius or 2
+	if data.hill_unit and workspace._terrain:FindFirstChild("hill") then
+		for _, p in Collection:HillPoints(anchor) do
+			local key = math.floor(p.X) .. "," .. math.floor(p.Z)
+			if not bad[key] then
+				local spot = Collection:PlacementSpot(data, p.X, p.Y, p.Z, radius, reserved)
+				if spot then return spot, key end
+			end
+		end
+		return nil
+	end
 	for r = 3, 30, 3 do
 		local steps = math.max(8, math.floor(2 * math.pi * r / 3))
 		for k = 0, steps - 1 do
@@ -1760,7 +1807,7 @@ function Collection:FindSpot(data, anchor, bad)
 			local x, z = anchor.X + math.cos(a) * r, anchor.Z + math.sin(a) * r
 			local key = math.floor(x) .. "," .. math.floor(z)
 			if not bad[key] then
-				local spot = Collection:PlacementSpot(data, x, anchor.Y, z, radius)
+				local spot = Collection:PlacementSpot(data, x, anchor.Y, z, radius, reserved)
 				if spot then return spot, key end
 			end
 		end
@@ -1782,83 +1829,190 @@ function Collection:PlaceMarker(slot)
 	return ball
 end
 
+-- a see-through copy of the unit at a spot it will be placed on, tagged "slot·copy"; on this client only.
+-- Clones the stored template, so no unit setup script runs.
+local HOLOGRAM_COLOR = Color3.fromRGB(132, 88, 240)
+local HOLOGRAM_STRIP = { "Decal", "Texture", "SurfaceAppearance", "Script", "LocalScript", "ModuleScript", "Humanoid",
+	"Sound", "ParticleEmitter", "Trail", "Beam", "BillboardGui", "Light" }
+function Collection:Hologram(s, spot, copy, parent)
+	local chars = Core.UnitServiceCore.unit_chars or {}
+	local template = chars[s.u.unit_id] or (s.data.evolved and chars[s.data.evolved.from])
+	local half = Collection:UnitHalfHeight(s.u.unit_id)
+	local cf = CFrame.lookAt(spot + Vector3.new(0, half, 0), Vector3.new(s.anchor.X, spot.Y + half, s.anchor.Z))
+	local holo = template and template:Clone()
+	if holo then
+		for _, d in holo:GetDescendants() do
+			local strip = false
+			for _, class in HOLOGRAM_STRIP do
+				if d:IsA(class) then strip = true break end
+			end
+			if strip then
+				d:Destroy()
+			elseif d:IsA("BasePart") then
+				d.Anchored, d.CanCollide, d.CanQuery, d.CanTouch, d.CastShadow = true, false, false, false, false
+				d.Material, d.Color = Enum.Material.ForceField, HOLOGRAM_COLOR
+				if d:IsA("MeshPart") then pcall(function() d.TextureID = "" end) end
+			elseif d:IsA("SpecialMesh") then
+				d.TextureId = ""
+			end
+		end
+		holo:PivotTo(cf)
+	else
+		local radius = s.data.override_hitbox_radius or 2
+		holo = Collection:Instance("Part", {
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, radius * 2, radius * 2), Anchored = true,
+			CanCollide = false, CanQuery = false, CanTouch = false, Material = Enum.Material.ForceField, Color = HOLOGRAM_COLOR,
+			CFrame = CFrame.new(spot + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		})
+	end
+	local tag = Collection:Instance("BillboardGui", {
+		Size = UDim2.fromOffset(34, 18), StudsOffsetWorldSpace = Vector3.new(0, 3, 0), AlwaysOnTop = true,
+		Adornee = holo:IsA("Model") and (holo.PrimaryPart or holo:FindFirstChildWhichIsA("BasePart")) or holo, Parent = holo,
+	})
+	Collection:Instance("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = s.slot .. "·" .. copy, TextScaled = true,
+		Font = Enum.Font.GothamBold, TextColor3 = Color3.new(1, 1, 1), TextStrokeTransparency = 0, Parent = tag,
+	})
+	holo.Parent = parent
+end
+
+-- lays out holograms for every placement still to come, in the order Auto Place will make them
+local hologramFolder
+function Collection:BuildHolograms(slots, bad, full)
+	if hologramFolder then hologramFolder:Destroy() end
+	hologramFolder = Collection:Instance("Folder", { Name = "VaderHolograms", Parent = workspace })
+	local counts, skip, reserved = {}, {}, {}
+	for _, s in slots do counts[s.slot] = s.count end
+	for _ = 1, 36 do
+		local pick
+		for _, s in slots do
+			if not full[s.uuid] and not skip[s.slot] and counts[s.slot] < s.cap and (not pick or counts[s.slot] < counts[pick.slot]) then
+				pick = s
+			end
+		end
+		if not pick then break end
+		local spot = Collection:FindSpot(pick.data, pick.anchor, bad, reserved)
+		if spot then
+			table.insert(reserved, { pos = spot, radius = pick.data.override_hitbox_radius or 2 })
+			counts[pick.slot] += 1
+			Collection:Hologram(pick, spot, counts[pick.slot], hologramFolder)
+		else
+			skip[pick.slot] = true
+		end
+	end
+end
+
+function Collection:ClearHolograms()
+	if hologramFolder then hologramFolder:Destroy() end
+	hologramFolder = nil
+end
+
 -- one placement per tick: the slot with the fewest units down goes next, slot order breaking ties
 if not IS_LOBBY then task.spawn(function()
 	local markers = {} -- slot -> ball
+	local hologramKey -- what the holograms were laid out for; rebuilt when it changes
 	local bad, refusals, full = {}, {}, {} -- refused spots, refusals in a row per unit, units at their limit
+	-- game code called from here can leave this thread without the executor's permissions; put them back each tick
+	local setIdentity = setthreadidentity or set_thread_identity
+	local identity = getthreadidentity and getthreadidentity()
 	while not closed do
 		task.wait(1)
-		local placed = {}
-		for _, m in Collection:MyUnits() do
-			placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1
-		end
-		local equipped = session.profile_data.collection.equipped_units
-		local pick, lines = nil, {}
-		for _, slot in Data.GameplaySettings.UNIT_SLOTS do
-			local cfg = State.Slots[slot]
-			local uuid = equipped[slot] or equipped[tonumber(slot)]
-			local u = uuid and Collection:Owned()[uuid]
-			local data = u and Data.Units[u.unit_id]
-			local anchor, where
-			if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot) end
-
-			if anchor and State.ShowPlacePoint then
-				markers[slot] = markers[slot] or Collection:PlaceMarker(slot)
-				markers[slot].Position = anchor + Vector3.new(0, 1, 0)
-			elseif markers[slot] then
-				markers[slot]:Destroy()
-				markers[slot] = nil
+		if setIdentity and identity then pcall(setIdentity, identity) end
+		local ok, problem = pcall(function()
+			local placed = {}
+			for _, m in Collection:MyUnits() do
+				placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1
 			end
+			local equipped = session.profile_data.collection.equipped_units
+			local pick, lines, slots = nil, {}, {}
+			for _, slot in Data.GameplaySettings.UNIT_SLOTS do
+				local cfg = State.Slots[slot]
+				local uuid = equipped[slot] or equipped[tonumber(slot)]
+				local u = uuid and Collection:Owned()[uuid]
+				local data = u and Data.Units[u.unit_id]
+				local anchor, where
+				if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot) end
 
-			if data and cfg.On then
-				local count, cap = placed[uuid] or 0, math.min(cfg.Max, data.spawn_cap or cfg.Max)
-				table.insert(lines, string.format("%s %s: %d/%d%s", slot, Collection:UnitName(u), count, cap,
-					anchor and (" at " .. where) or (" - " .. where)))
-				if anchor and not full[uuid] and count < cap and (not pick or count < pick.count) then
-					pick = { slot = slot, uuid = uuid, u = u, data = data, count = count, anchor = anchor }
+				if anchor and State.ShowPlacePoint then
+					markers[slot] = markers[slot] or Collection:PlaceMarker(slot)
+					markers[slot].Position = anchor + Vector3.new(0, 1, 0)
+				elseif markers[slot] then
+					markers[slot]:Destroy()
+					markers[slot] = nil
 				end
-			end
-		end
 
-		placePending = State.AutoPlace and not State.PlayMacro and pick ~= nil
-		local note
-		if not State.AutoPlace then
-			note = "Auto Place is off."
-		elseif State.PlayMacro then
-			note = "Paused while Play Macro is on."
-		elseif not pick then
-			note = "Every slot that's on is placed."
-		else
-			local name = "slot " .. pick.slot .. " " .. Collection:UnitName(pick.u)
-			local cost = math.ceil(session.collection:get_upgraded_unit_data(pick.u.unit_id).cost
-				* Core.UnitServiceCore.calculate_spawn_cost_multiplier(session))
-			if Collection:Money() < cost then
-				note = string.format("Next: %s - waiting for %d¥", name, cost)
-			elseif session.collection:is_unit_on_cooldown(pick.uuid) then
-				note = "Next: " .. name .. " - on cooldown"
-			else
-				local spot, key = Collection:FindSpot(pick.data, pick.anchor, bad)
-				if not spot then
-					full[pick.uuid] = true
-					note = "No free spot for " .. name .. " within 30 studs of its point - skipping it."
-				else
-					local pos = spot + Vector3.new(0, Collection:UnitHalfHeight(pick.u.unit_id), 0)
-					if Collection:Invoke("spawn_unit", pick.uuid, CFrame.lookAt(pos, Vector3.new(pick.anchor.X, pos.Y, pick.anchor.Z))) then
-						refusals[pick.uuid] = 0
-						note = string.format("Placed %s #%d", name, pick.count + 1)
-					else
-						bad[key] = true
-						refusals[pick.uuid] = (refusals[pick.uuid] or 0) + 1
-						-- refused at several spots in a row: the unit is at the server's limit
-						if refusals[pick.uuid] >= 5 then full[pick.uuid] = true end
-						note = string.format("%s was refused at a spot (%d/5)", name, refusals[pick.uuid])
+				if data and cfg.On then
+					local count, cap = placed[uuid] or 0, math.min(cfg.Max, data.spawn_cap or cfg.Max)
+					table.insert(lines, string.format("%s %s%s: %d/%d%s", slot, Collection:UnitName(u), Collection:PlacementTag(data), count, cap,
+						anchor and (" at " .. where) or (" - " .. where)))
+					if anchor then
+						table.insert(slots, { slot = slot, uuid = uuid, u = u, data = data, count = count, cap = cap, anchor = anchor })
+					end
+					if anchor and not full[uuid] and count < cap and (not pick or count < pick.count) then
+						pick = { slot = slot, uuid = uuid, u = u, data = data, count = count, anchor = anchor }
 					end
 				end
 			end
-		end
-		PlaceStatus:SetDesc(note .. (#lines > 0 and ("\n" .. table.concat(lines, "\n")) or ""))
+
+			placePending = State.AutoPlace and not State.PlayMacro and pick ~= nil
+			local note
+			if not State.AutoPlace then
+				note = "Auto Place is off."
+			elseif State.PlayMacro then
+				note = "Paused while Play Macro is on."
+			elseif not pick then
+				note = "Every slot that's on is placed."
+			else
+				local name = "slot " .. pick.slot .. " " .. Collection:UnitName(pick.u)
+				local cost = math.ceil(session.collection:get_upgraded_unit_data(pick.u.unit_id).cost
+					* Core.UnitServiceCore.calculate_spawn_cost_multiplier(session))
+				if Collection:Money() < cost then
+					note = string.format("Next: %s - waiting for %d¥", name, cost)
+				elseif session.collection:is_unit_on_cooldown(pick.uuid) then
+					note = "Next: " .. name .. " - on cooldown"
+				else
+					local spot, key = Collection:FindSpot(pick.data, pick.anchor, bad)
+					if not spot then
+						full[pick.uuid] = true
+						note = pick.data.hill_unit and ("No free hill spot for " .. name .. " - skipping it.")
+							or ("No free spot for " .. name .. " within 30 studs of its point - skipping it.")
+					else
+						local pos = spot + Vector3.new(0, Collection:UnitHalfHeight(pick.u.unit_id), 0)
+						if Collection:Invoke("spawn_unit", pick.uuid, CFrame.lookAt(pos, Vector3.new(pick.anchor.X, pos.Y, pick.anchor.Z))) then
+							refusals[pick.uuid] = 0
+							note = string.format("Placed %s #%d", name, pick.count + 1)
+						else
+							bad[key] = true
+							refusals[pick.uuid] = (refusals[pick.uuid] or 0) + 1
+							-- refused at several spots in a row: the unit is at the server's limit
+							if refusals[pick.uuid] >= 5 then full[pick.uuid] = true end
+							note = string.format("%s was refused at a spot (%d/5)", name, refusals[pick.uuid])
+						end
+					end
+				end
+			end
+			PlaceStatus:SetDesc(note .. (#lines > 0 and ("\n" .. table.concat(lines, "\n")) or ""))
+
+			if State.ShowHolograms then
+				local key, refused = { #CollectionService:GetTagged("player_units") }, 0
+				for _ in bad do refused += 1 end
+				for _, s in slots do
+					table.insert(key, string.format("%s:%d/%d%s@%.0f,%.0f", s.slot, s.count, s.cap, full[s.uuid] and "F" or "", s.anchor.X, s.anchor.Z))
+				end
+				key = table.concat(key, "|") .. "#" .. refused
+				if key ~= hologramKey then
+					hologramKey = key
+					Collection:BuildHolograms(slots, bad, full)
+				end
+			elseif hologramKey then
+				hologramKey = nil
+				Collection:ClearHolograms()
+			end
+		end)
+		if not ok then pcall(PlaceStatus.SetDesc, PlaceStatus, "Auto Place error: " .. tostring(problem)) end
 	end
 	for _, ball in markers do ball:Destroy() end
+	Collection:ClearHolograms()
 end) end
 
 local dungeonMatchOver = false -- a dungeon room is only picked after its match ends
@@ -2528,6 +2682,37 @@ secCommunity:AddButton({
 		end
 	end,
 })
+
+-- every slider's value doubles as a text box: type a number, then Enter or click away. It goes through the slider's
+-- own SetValue, so it's clamped and rounded like a drag, and dragging still updates the box.
+function Collection:TypeableSliders()
+	for _, option in VaderUI.Options do
+		if option.Type == "Slider" and option.Frame then
+			for _, label in option.Frame:GetDescendants() do
+				if label:IsA("TextLabel") and label.TextXAlignment == Enum.TextXAlignment.Right then
+					local box = Collection:Instance("TextBox", {
+						Text = label.Text, ClearTextOnFocus = false, Font = label.Font, TextSize = label.TextSize,
+						TextColor3 = label.TextColor3, TextXAlignment = Enum.TextXAlignment.Right, BackgroundTransparency = 1,
+						AnchorPoint = label.AnchorPoint, Position = label.Position, Size = label.Size, ZIndex = label.ZIndex + 1,
+						Parent = label.Parent,
+					})
+					label.TextTransparency = 1
+					label:GetPropertyChangedSignal("Text"):Connect(function()
+						if not box:IsFocused() then box.Text = label.Text end
+					end)
+					label:GetPropertyChangedSignal("TextColor3"):Connect(function() box.TextColor3 = label.TextColor3 end)
+					box.FocusLost:Connect(function()
+						local value = tonumber(box.Text)
+						if value then option:SetValue(value) end
+						box.Text = label.Text
+					end)
+					break
+				end
+			end
+		end
+	end
+end
+Collection:TypeableSliders()
 
 if canPersist then
 	local ok, problem = Collection:LoadProfile()
