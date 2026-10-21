@@ -12,6 +12,8 @@ local State = {
 	Join = {}, Stage = {}, Difficulty = "Normal", FriendsOnly = false,
 	AutoJoinChallenge = false, Loadout = "Don't change", TeleportDelay = 0,
 	-- event
+	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
+	AutoDiscard = false, DiscardSpells = {},
 	AutoContract = false, ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
 	AutoEventShop = false, EventShopItems = {},
@@ -23,11 +25,11 @@ local State = {
 	MacroName = nil, AutoSwitchMacro = false,
 	-- match
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
-	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {},
+	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {}, UpgradeOrder = "Cheapest first",
 	AutoAbility = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
-	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true,
+	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true, FarmsFirst = false, ShowSpots = false,
 	Slots = {}, -- slot id -> { On, Mode, Percent, Max }
 	-- summon
 	AutoSummon = false, Banner = nil, SummonPay = "Gems x10", KeepGems = 0,
@@ -65,6 +67,7 @@ local Window = VaderUI:CreateWindow({
 Env.VaderMapStarter = VaderUI
 
 function Collection:Notify(message)
+	Collection:Elevate()
 	VaderUI:Notify({ Title = MAP_NAME, Content = tostring(message), Duration = 4 })
 end
 
@@ -109,10 +112,18 @@ local IS_LOBBY = workspace._MAP_CONFIG.IsLobby.Value
 --------------------------- [[ Game Functions ]] ---------------------------
 
 function Collection:Invoke(name, ...)
-	local remote = toServer:FindFirstChild(name)
-	if not remote then return nil end
-	local ok, result = pcall(remote.InvokeServer, remote, ...)
+	if not toServer:FindFirstChild(name) then return nil end
+	-- through the recorder, so Auto Place / Upgrade / Sell / Ability land in a macro being recorded
+	local ok, result = pcall(Collection.RecordingInvoke, name, ...)
 	return ok and result or nil
+end
+
+-- game code run on a hub thread strips the executor's permissions until the thread next yields, and UI writes
+-- need them: put them back before touching the UI
+Collection.Identity = getthreadidentity and getthreadidentity()
+function Collection:Elevate()
+	local set = setthreadidentity or set_thread_identity
+	if set and Collection.Identity then pcall(set, Collection.Identity) end
 end
 
 -- Waits Teleport Delay before an action that sends you to another place. wanted() is checked every tick, so
@@ -128,6 +139,15 @@ function Collection:TeleportDelay(why, wanted)
 end
 
 function Collection:Owned() return session.collection.collection_profile_data.owned_units end
+-- money units (C.E.O., Bulby): the game gives them a farm_amount
+function Collection:IsFarm(unitId) return Data.Units[unitId] ~= nil and Data.Units[unitId].farm_amount ~= nil end
+-- a unit by uuid: yours, or one the match lends you (event stages that hand out random units)
+function Collection:Unit(uuid) return Collection:Owned()[uuid] or (session.collection.temporary_units or {})[uuid] end
+-- this match's team, slot -> uuid. Like the game's get_unit_in_equipped_slot: in events that hand out random units the
+-- override is the team even when it's empty (everything placed, waiting for new ones)
+function Collection:Equipped()
+	return session.override_equipped_units or session.profile_data.collection.equipped_units
+end
 function Collection:UnitName(u) return (Data.Units[u.unit_id] and Data.Units[u.unit_id].name) or u.unit_id end
 function Collection:Gems() return LP._stats.gem_amount.Value end
 function Collection:Money() return LP._stats.resource.Value end
@@ -164,8 +184,7 @@ local canPersist = type(isfile) == "function" and type(readfile) == "function"
 local profileFolder = "Vaderhug/" .. MAP_NAME:gsub("[^%w_%-]", "")
 local profilePath = profileFolder .. "/" .. LP.Name .. ".json"
 local macroFolder = profileFolder .. "/macros"
-local macroAssignPath = profileFolder .. "/macro_assignments.json"
-local challengePath = profileFolder .. "/" .. LP.Name .. "_challenge.json"
+local macroAssignPath = profileFolder .. "/macro_assignments.json"local challengePath = profileFolder .. "/" .. LP.Name .. "_challenge.json"
 if canPersist then
 	if not isfolder("Vaderhug") then makefolder("Vaderhug") end
 	if not isfolder(profileFolder) then makefolder(profileFolder) end
@@ -270,8 +289,8 @@ function Collection:MacroUnit(unitId)
 	local placed = {}
 	for _, m in Collection:MyUnits() do placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1 end
 	local best
-	for _, uuid in session.profile_data.collection.equipped_units do
-		local u = Collection:Owned()[uuid]
+	for _, uuid in Collection:Equipped() do
+		local u = Collection:Unit(uuid)
 		if u and u.unit_id == unitId and (not best or (placed[uuid] or 0) < (placed[best] or 0)) then best = uuid end
 	end
 	return best
@@ -280,7 +299,7 @@ end
 -- which recorded spawn a unit model came from: same unit, closest to where it was placed
 function Collection:SpawnIndexOf(steps, model)
 	local st = typeof(model) == "Instance" and model:FindFirstChild("_stats")
-	local u = st and st:FindFirstChild("uuid") and Collection:Owned()[st.uuid.Value]
+	local u = st and st:FindFirstChild("uuid") and Collection:Unit(st.uuid.Value)
 	if not u then return nil end
 	local pos, best, bestDist = model:GetPivot().Position, nil, math.huge
 	for i, step in steps do
@@ -304,7 +323,7 @@ function Collection.RecordingInvoke(name, ...)
 	local step
 	if action == "spawn" then
 		local uuid, cf = ...
-		local u = Collection:Owned()[uuid]
+		local u = Collection:Unit(uuid)
 		step = u and { type = action, wave = Collection:Wave(), unit_id = u.unit_id, cf = { cf:GetComponents() } }
 	elseif action then
 		-- resolve the unit before the call: a sold unit is gone afterwards
@@ -643,6 +662,71 @@ function Collection:RefreshEventStatus()
 end
 Collection:RefreshEventStatus()
 
+local EventStageSection = Tabs.Event:AddSection("Event Stage")
+EventStageSection:AddToggle("AutoJoinEvent", {
+	Title = "Auto Join", Default = false,
+	Description = "In the lobby: joins the event stage on the event pads (April Fools right now).",
+	Callback = function(value) State.AutoJoinEvent = value end,
+})
+EventStageSection:AddDropdown("EventJoinBy", {
+	Title = "Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
+	Description = "Normal starts it on your own, like Play Solo. Matchmaking queues with other players; turning Auto Join off leaves the queue.",
+	Callback = function(value) State.EventJoinBy = value end,
+})
+
+-- ids are what Collection:CardKind gives a card; the game only reveals cards when it offers them, so kinds, not titles
+local CardSection = Tabs.Event:AddSection("Event Cards")
+CardSection:AddToggle("AutoPickCards", {
+	Title = "Auto Pick Cards", Default = false,
+	Description = "When the event offers cards, votes for the one highest in Card Priority.",
+	Callback = function(value) State.AutoPickCards = value end,
+})
+Collection:AddPriorityList(CardSection, "CardPriority", {
+	Title = "Card Priority",
+	Description = "Top first, judged by the card's main effect. Unticked kinds are never picked; if every card offered is unticked, the game decides.",
+	Rows = 8,
+	Entries = {
+		{ id = "stat:damage", label = "Attack" },
+		{ id = "stat:attack_cooldown", label = "Attack Speed" },
+		{ id = "stat:range", label = "Range" },
+		{ id = "boss_damage", label = "Boss Damage" },
+		{ id = "stat:active_attack_cooldown", label = "Ability Cooldown" },
+		{ id = "resource_gain", label = "Yen", desc = "¥ now" },
+		{ id = "random_blessings", label = "Random Blessings" },
+		{ id = "secret_drop", label = "Secret Drop Rate" },
+		{ id = "candy_multiplier", label = "Event Currency" },
+		{ id = "enemy_stat_mul:health", label = "Enemy Health", desc = "curse" },
+		{ id = "enemy_resistance_specific:all", label = "Resistant Enemies", desc = "curse: resist all damage" },
+		{ id = "enemy_resistance_specific:physical", label = "Plated Enemies", desc = "curse: resist physical" },
+		{ id = "enemy_resistance_specific:magic", label = "Spellproof Enemies", desc = "curse: resist magic" },
+		{ id = "enemy_regen", label = "Enemy Regen", desc = "curse" },
+		{ id = "enemy_shield", label = "Enemy Shield", desc = "curse" },
+		{ id = "enemy_passive_chance", label = "Enemy Passives", desc = "curse" },
+		{ id = "enemy_bomb", label = "Explosive Deaths", desc = "curse" },
+		{ id = "enemy_speedup", label = "Enemy Speed", desc = "curse" },
+		{ id = "unit_cost", label = "Unit Cost", desc = "curse" },
+		{ id = "random_curses", label = "Random Curses", desc = "curse" },
+		{ id = "new_path", label = "New Path", desc = "curse: an extra enemy lane" },
+	},
+	Callback = function(value) State.CardPriority = value end,
+})
+
+-- events that hand out random units also hand out spells, each with an X that swaps it for something new
+local spellNames = {}
+for _, spell in Data.IngameSpells or {} do table.insert(spellNames, spell.name) end
+table.sort(spellNames)
+local SpellSection = Tabs.Event:AddSection("Event Spells")
+SpellSection:AddToggle("AutoDiscard", {
+	Title = "Auto Discard", Default = false,
+	Description = "In events that hand out random units: presses the X on the picked spells as soon as you get them, so a new unit or spell comes in.",
+	Callback = function(value) State.AutoDiscard = value end,
+})
+SpellSection:AddDropdown("DiscardSpells", {
+	Title = "Discard Spells", Values = spellNames, Multi = true, Default = {},
+	Description = "Spells you keep stay in their slot until you use them.",
+	Callback = function(value) State.DiscardSpells = value end,
+})
+
 local ContractSection = Tabs.Event:AddSection("Event Contracts")
 ContractSection:AddToggle("AutoContract", {
 	Title = "Auto Contract", Default = false,
@@ -821,6 +905,11 @@ PlaceSection:AddToggle("AutoPlace", {
 	Description = "Places the slots that are on around each slot's own point: one of each unit, then second copies, and so on, slot order breaking ties. Waits for money, and pauses while Play Macro is on.",
 	Callback = function(value) State.AutoPlace = value end,
 })
+PlaceSection:AddToggle("FarmsFirst", {
+	Title = "Farms First", Default = false,
+	Description = "Places money units (C.E.O., Bulby) before everything else, so income starts early.",
+	Callback = function(value) State.FarmsFirst = value end,
+})
 PlaceSection:AddToggle("ShowHolograms", {
 	Title = "Show Holograms", Default = true,
 	Description = "See-through copies of your units on the exact spots Auto Place will use, in order, tagged slot·copy. On your screen only.",
@@ -830,6 +919,11 @@ PlaceSection:AddToggle("ShowPlacePoint", {
 	Title = "Show Placement Points", Default = true,
 	Description = "A numbered glowing ball at each slot's point, on your screen only.",
 	Callback = function(value) State.ShowPlacePoint = value end,
+})
+PlaceSection:AddToggle("ShowSpots", {
+	Title = "Show Valid Spots", Default = false,
+	Description = "A dot on every spot a ground unit can stand within 30 studs of the enemy path: green by the road, yellow mid-range, red 30 studs back. On your screen only.",
+	Callback = function(value) State.ShowSpots = value end,
 })
 
 -- where a unit can stand, for slot titles and the status
@@ -849,10 +943,10 @@ function Collection:SetSlotPosition(slot)
 end
 
 for _, slot in Data.GameplaySettings.UNIT_SLOTS do
-	local cfg = { On = true, Mode = "Enemy path", Percent = 50, Max = 6 }
+	local cfg = { On = true, Mode = "Enemy path", Percent = 50, Max = 6, Hug = 100, Style = "Line along road" }
 	State.Slots[slot] = cfg
-	local equipped = session.profile_data.collection.equipped_units
-	local u = Collection:Owned()[equipped[slot] or equipped[tonumber(slot)] or ""]
+	local equipped = Collection:Equipped()
+	local u = Collection:Unit(equipped[slot] or equipped[tonumber(slot)] or "")
 	local cap = u and Data.Units[u.unit_id] and Data.Units[u.unit_id].spawn_cap
 	local section = Tabs.AutoPlay:AddSection("Slot " .. slot .. " - "
 		.. (u and (Collection:UnitName(u) .. Collection:PlacementTag(Data.Units[u.unit_id] or {})) or "empty"))
@@ -869,6 +963,16 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 		Description = "0 is where enemies spawn, 100 is your base. Used with Enemy path.",
 		Callback = function(value) cfg.Percent = value end,
 	})
+	section:AddSlider("Slot" .. slot .. "Hug", {
+		Title = "Path Hug (%)", Default = 100, Min = 0, Max = 100, Rounding = 0,
+		Description = "How close to the road: 100 lines the road edge, lower stands further back, 0 at the edge of the unit's range. Used with Enemy path.",
+		Callback = function(value) cfg.Hug = value end,
+	})
+	section:AddDropdown("Slot" .. slot .. "Style", {
+		Title = "Placing Style", Values = { "Line along road", "Cluster at point" }, Default = "Line along road", Multi = false,
+		Description = "Line along road: copies line up beside the road both ways from the Path Point, as far as needed. Cluster at point: copies gather within 30 studs of it. Used with Enemy path.",
+		Callback = function(value) cfg.Style = value end,
+	})
 	section:AddSlider("Slot" .. slot .. "Max", {
 		Title = "Max Placed", Default = 6, Min = 1, Max = 6, Rounding = 0,
 		Description = cap and ("This unit can be placed " .. cap .. " time" .. (cap == 1 and "" or "s") .. " at most.") or nil,
@@ -884,12 +988,17 @@ end
 local UpgradeSection = Tabs.AutoPlay:AddSection("Upgrade & Abilities")
 UpgradeSection:AddToggle("AutoUpgrade", {
 	Title = "Auto Upgrade", Default = false,
-	Description = "Picked units first, then the cheapest upgrade.",
+	Description = "Upgrade First picks, then by Upgrade Order. Waits while a macro is playing, then takes over once it finishes.",
 	Callback = function(value) State.AutoUpgrade = value end,
 })
 UpgradeSection:AddDropdown("UpgradeFirst", {
 	Title = "Upgrade First", Values = equippedNames, Multi = true, Default = {},
 	Callback = function(value) State.UpgradeFirst = value end,
+})
+UpgradeSection:AddDropdown("UpgradeOrder", {
+	Title = "Upgrade Order", Values = { "Cheapest first", "Farms first", "Strongest first" }, Default = "Cheapest first", Multi = false,
+	Description = "For everything not in Upgrade First, e.g. the random units in event stages. Farms first upgrades money units before the rest; Strongest first keeps feeding your highest-damage unit.",
+	Callback = function(value) State.UpgradeOrder = value end,
 })
 UpgradeSection:AddToggle("PlaceBeforeUpgrading", {
 	Title = "Place Before Upgrading", Default = true,
@@ -1117,6 +1226,7 @@ MacroSwitch:AddButton({
 })
 
 function Collection:RefreshMacroLists()
+	Collection:Elevate()
 	local names = Collection:ListMacros()
 	for _, id in { "MacroName", "AssignMacro" } do
 		local option = VaderUI.Options[id]
@@ -1453,6 +1563,10 @@ Tabs.Traits:AddButton({
 
 local ClaimSection = Tabs.Rewards:AddSection("Auto Claim")
 local RewardStatus = ClaimSection:AddParagraph({ Title = "Status", Content = "Checks every minute." })
+for _, paragraph in { JoinStatus, EventStatus, DungeonStatus, MatchStatus, PlaceStatus, MacroStatus, AssignList, SummonStatus, TraitStatus, StatStatus, RewardStatus } do
+	local setDesc = paragraph.SetDesc
+	function paragraph:SetDesc(text) Collection:Elevate() return setDesc(self, text) end
+end
 ClaimSection:AddToggle("AutoDaily", {
 	Title = "Daily Reward", Default = false,
 	Callback = function(value) State.AutoDaily = value end,
@@ -1632,6 +1746,44 @@ function Collection:JoinChallenge()
 	return nil, "No free challenge pad"
 end
 
+-- the event stage on the lobby's event pads: walk in like Play Solo, or queue like the Matchmaking button
+function Collection:JoinEvent()
+	local folder = workspace:FindFirstChild("_EVENT_CHALLENGES") and workspace._EVENT_CHALLENGES:FindFirstChild("Lobbies")
+	local level
+	for _, pad in folder and folder:GetChildren() or {} do
+		if pad:FindFirstChild("Level") and pad.Level.Value ~= "" then level = pad.Level.Value break end
+	end
+	if not level then return nil, "Event: no event pad in this lobby." end
+	local name = Data.Levels[level] and Data.Levels[level].name or level
+	if State.EventJoinBy == "Matchmaking" then
+		if not Collection:TeleportDelay("Matchmaking " .. name, function() return State.AutoJoinEvent end) then
+			return nil, "Event: matchmaking cancelled."
+		end
+		Collection:Invoke("request_matchmaking", level)
+		JoinStatus:SetDesc("Event: matchmaking for " .. name .. "...")
+		-- the queue holds the lobby loop until it ends; turning Auto Join off leaves it
+		local queue, t0 = LP.PlayerGui:FindFirstChild("MatchmakingUI"), os.clock()
+		while not closed and (os.clock() - t0 < 5 or (queue and queue.Enabled)) do
+			if not State.AutoJoinEvent then
+				Collection:Invoke("leave_matchmaking")
+				return nil, "Event: left matchmaking."
+			end
+			task.wait(1)
+		end
+		task.wait(10) -- a match found teleports us during this
+		return nil, "Event: matchmaking ended without a match."
+	end
+	local pad = Collection:FreePad(folder)
+	if not pad then return nil, "Event: no free pad." end
+	if not Collection:Invoke("request_join_lobby", pad.Name) then return nil, "Event: couldn't join a pad." end
+	if not Collection:TeleportDelay("Starting " .. name, function() return State.AutoJoinEvent end) then
+		Collection:Invoke("request_leave_lobby", pad.Name)
+		return nil, "Event: start cancelled."
+	end
+	Collection:Invoke("request_start_game", pad.Name)
+	return pad, "Starting event: " .. name
+end
+
 local WEAK_TYPES = { Physical = "physical", Magic = "magic" }
 
 -- the biggest weakness among the picked damage types; 0 when none are picked, nil when none match
@@ -1741,13 +1893,14 @@ if IS_LOBBY then
 		task.wait(5)
 		while not closed do
 			-- an auto dungeon run (or one about to start) has the lobby to itself
-			if (State.AutoJoinChallenge or State.AutoContract or Collection:AnyModeOn()) and not Collection:InPad()
+			if (State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or Collection:AnyModeOn()) and not Collection:InPad()
 				and not (State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)) then
 				local pad, msg
 				local notes = {}
 				for _, try in {
 					{ State.AutoJoinChallenge, Collection.JoinChallenge },
 					{ State.AutoContract, Collection.JoinContract },
+					{ State.AutoJoinEvent, Collection.JoinEvent },
 				} do
 					if pad then break end
 					if try[1] then
@@ -1793,13 +1946,46 @@ function Collection:MyUnits()
 end
 
 function Collection:UpgradeCost(m)
-	local ok, info, isMax = pcall(Client.GUIService.get_next_upgrade_info, m, Collection:Owned()[m._stats.uuid.Value] or {})
+	local ok, info, isMax = pcall(Client.GUIService.get_next_upgrade_info, m, Collection:Unit(m._stats.uuid.Value) or {})
 	if ok and info and not isMax then return math.ceil(info.cost * Core.UnitServiceCore.calculate_upgrade_cost_multiplier(m, session)) end
+end
+
+-- an event card's kind: its first effect that isn't the event-currency bonus most curses carry
+function Collection:CardKind(card)
+	local main
+	for _, e in card.effects or {} do
+		if e.type ~= "candy_multiplier" then main = e break end
+	end
+	main = main or (card.effects or {})[1]
+	if not main then return "?" end
+	if main.type == "random_effects" then return main._type == "Good" and "random_blessings" or "random_curses" end
+	if main.stat and main.type:match("^stat_") then return "stat:" .. main.stat end
+	if main.type == "enemy_resistance_specific" then
+		-- Plated Enemies resists one damage type, Resistant Enemies all of them
+		local types = 0
+		for _, e in card.effects do if e.type == main.type then types += 1 end end
+		return main.type .. ":" .. (types > 1 and "all" or tostring(main.damage_type))
+	end
+	return main.type .. (main.stat and ":" .. main.stat or "")
+end
+
+-- the offered card highest in Card Priority; kinds the list doesn't know rank after every listed one
+function Collection:PickCard(options)
+	local rank = {}
+	for i, entry in State.CardPriority do rank[entry.id] = entry.on and i end
+	local bestKey, bestRank
+	for key, card in options do
+		local r = rank[Collection:CardKind(card)]
+		if r == nil then r = #State.CardPriority + 1 end
+		if r and (not bestRank or r < bestRank) then bestKey, bestRank = key, r end
+	end
+	return bestKey
 end
 
 --------------------------- [[ Auto Play ]] ---------------------------
 
 local placePending = false -- Auto Place still has units to put down; Place Before Upgrading holds upgrades meanwhile
+local macroPending = false -- Play Macro still has steps left; Auto Upgrade waits so the macro gets the money
 
 -- a slot's point: a spot along the first enemy lane, or the position saved for this map and slot
 function Collection:PlaceAnchor(slot)
@@ -1809,17 +1995,54 @@ function Collection:PlaceAnchor(slot)
 		if not p then return nil, "no spot saved on this map" end
 		return Vector3.new(p[1], p[2], p[3]), "saved spot"
 	end
+	local base, lanes, visible = Collection:Lanes()
+	if not lanes then return nil, "enemy path not loaded yet" end
+	local lane = visible[1]
+	if not lane then return nil, "no enemy path on this map" end
+	local _, _, position = Core.PathService.get_path_position_by_distance_from_spawn(base, lane, lanes[lane].total_distance * cfg.Percent / 100)
+	return position, cfg.Percent .. "% of the path"
+end
+
+-- the map's enemy lanes: the base, the game's path cache, and the visible lane folders by name
+function Collection:Lanes()
 	local PathService = Core.PathService
 	local base = workspace:FindFirstChild("_BASES") and workspace._BASES:FindFirstChild("pve")
 	local lanes = base and PathService.PATH_CACHE and PathService.PATH_CACHE[base]
-	if not lanes then return nil, "enemy path not loaded yet" end
-	local lane
-	for laneFolder in lanes do
-		if not (PathService.HIDDEN_MOCK_LANES or {})[laneFolder.Name] and (not lane or laneFolder.Name < lane.Name) then lane = laneFolder end
+	local visible = {}
+	for laneFolder in lanes or {} do
+		if not (PathService.HIDDEN_MOCK_LANES or {})[laneFolder.Name] then table.insert(visible, laneFolder) end
 	end
-	if not lane then return nil, "no enemy path on this map" end
-	local _, _, position = PathService.get_path_position_by_distance_from_spawn(base, lane, lanes[lane].total_distance * cfg.Percent / 100)
-	return position, cfg.Percent .. "% of the path"
+	table.sort(visible, function(a, b) return a.Name < b.Name end)
+	return base, lanes, visible
+end
+
+-- points every step studs (3 when not given) along one lane, spawn to base
+function Collection:LanePoints(base, lanes, lane, step)
+	local points = {}
+	for d = 0, lanes[lane].total_distance, step or 3 do
+		local _, _, position = Core.PathService.get_path_position_by_distance_from_spawn(base, lane, d)
+		table.insert(points, position)
+	end
+	return points
+end
+
+-- the same along every visible lane (new lanes from event cards included), to measure distance to the road
+function Collection:PathPoints()
+	local base, lanes, visible = Collection:Lanes()
+	local points = {}
+	for _, lane in visible do
+		for _, p in Collection:LanePoints(base, lanes, lane) do table.insert(points, p) end
+	end
+	return points
+end
+
+function Collection:PathDistance(points, x, z)
+	local best = math.huge
+	for _, p in points do
+		local d = (p.X - x) ^ 2 + (p.Z - z) ^ 2
+		if d < best then best = d end
+	end
+	return math.sqrt(best)
 end
 
 -- the game lifts a placement by half the unit model's height. Read from the stored template: building a model
@@ -1835,13 +2058,14 @@ function Collection:UnitHalfHeight(unitId)
 	return unitHalfHeight[unitId]
 end
 
--- ground (or hill) the game accepts at x, z, off the road and clear of other units' hitboxes (and of reserved
--- { pos, radius } spots, used to lay out holograms); mirrors PlacementCore
+-- ground (or hill) the game accepts at x, z. Like the game's placement check (a thin stick through the new unit's
+-- centre, PlacementServiceClient), only the centre has to stay off the road and outside other units' hitboxes, so units
+-- can stand as close as the game allows. reserved { pos, radius } spots stand in for holograms not placed yet
 local placeRay = RaycastParams.new()
 placeRay.FilterType = Enum.RaycastFilterType.Include
 local roadOverlap = OverlapParams.new()
 roadOverlap.FilterType = Enum.RaycastFilterType.Include
-function Collection:PlacementSpot(data, x, y, z, radius, reserved)
+function Collection:PlacementSpot(data, x, y, z, reserved)
 	local terrain = workspace:FindFirstChild("_terrain")
 	if not terrain then return nil end
 	placeRay.FilterDescendantsInstances = { terrain }
@@ -1859,30 +2083,32 @@ function Collection:PlacementSpot(data, x, y, z, radius, reserved)
 	end
 	if workspace:FindFirstChild("_road") then
 		roadOverlap.FilterDescendantsInstances = { workspace._road }
-		if #workspace:GetPartBoundsInRadius(hit.Position, radius, roadOverlap) > 0 then return nil end
+		if #workspace:GetPartBoundsInBox(CFrame.new(hit.Position + Vector3.new(0, 2.5, 0)), Vector3.new(0.2, 5, 0.2), roadOverlap) > 0 then return nil end
 	end
 	for _, m in workspace._UNITS:GetChildren() do
 		local box = m:FindFirstChild("_hitbox")
-		if box and CollectionService:HasTag(m, "player_units")
-			and Vector2.new(box.Position.X - hit.Position.X, box.Position.Z - hit.Position.Z).Magnitude < radius + box.Size.Z / 2 then
-			return nil
+		if box and CollectionService:HasTag(m, "player_units") then
+			local rel = box.CFrame:PointToObjectSpace(hit.Position)
+			local inside = box.Shape == Enum.PartType.Ball and Vector2.new(rel.X, rel.Z).Magnitude < box.Size.X / 2
+				or math.abs(rel.X) < box.Size.X / 2 and math.abs(rel.Z) < box.Size.Z / 2
+			if inside then return nil end
 		end
 	end
 	for _, r in reserved or {} do
-		if Vector2.new(r.pos.X - hit.Position.X, r.pos.Z - hit.Position.Z).Magnitude < radius + r.radius then return nil end
+		if Vector2.new(r.pos.X - hit.Position.X, r.pos.Z - hit.Position.Z).Magnitude < r.radius then return nil end
 	end
 	return hit.Position
 end
 
--- points 3 studs apart across the tops of the map's hill parts, nearest to the anchor first
+-- points 1.5 studs apart across the tops of the map's hill parts, nearest to the anchor first
 function Collection:HillPoints(anchor)
 	local hill = workspace:FindFirstChild("_terrain") and workspace._terrain:FindFirstChild("hill")
 	local points = {}
 	for _, part in hill and hill:GetDescendants() or {} do
 		if part:IsA("BasePart") then
 			local size = part.Size
-			for x = -size.X / 2 + 1.5, size.X / 2 - 1.5, 3 do
-				for z = -size.Z / 2 + 1.5, size.Z / 2 - 1.5, 3 do
+			for x = -size.X / 2 + 0.75, size.X / 2 - 0.75, 1.5 do
+				for z = -size.Z / 2 + 0.75, size.Z / 2 - 0.75, 1.5 do
 					table.insert(points, part.CFrame * Vector3.new(x, size.Y / 2, z))
 				end
 			end
@@ -1892,30 +2118,70 @@ function Collection:HillPoints(anchor)
 	return points
 end
 
--- the nearest free spot around the anchor: rings 3 studs apart, out to 30 studs. Hill units can only stand on hills,
--- so they search the hill parts instead, wherever those are. bad holds spots the server refused
-function Collection:FindSpot(data, anchor, bad, reserved)
-	local radius = data.override_hitbox_radius or 2
+-- a free spot for a unit. With hug (Path Hug %), spots at (100 - hug)% of the unit's range from the road come first,
+-- in 2-stud bands. line (Placing Style "Line along road") takes spots beside the first lane, nearest the anchor along
+-- the road, as far as it runs; otherwise rings within 30 studs, nearest the anchor. Candidates are 1.5 studs apart so
+-- units pack as tight as PlacementSpot allows. Hill units can only stand on hills, so they search the hill parts
+-- instead. bad holds spots the server refused
+function Collection:FindSpot(data, anchor, bad, reserved, hug, line)
 	if data.hill_unit and workspace._terrain:FindFirstChild("hill") then
 		for _, p in Collection:HillPoints(anchor) do
 			local key = math.floor(p.X) .. "," .. math.floor(p.Z)
 			if not bad[key] then
-				local spot = Collection:PlacementSpot(data, p.X, p.Y, p.Z, radius, reserved)
+				local spot = Collection:PlacementSpot(data, p.X, p.Y, p.Z, reserved)
 				if spot then return spot, key end
 			end
 		end
 		return nil
 	end
-	for r = 3, 30, 3 do
-		local steps = math.max(8, math.floor(2 * math.pi * r / 3))
-		for k = 0, steps - 1 do
-			local a = 2 * math.pi * k / steps
-			local x, z = anchor.X + math.cos(a) * r, anchor.Z + math.sin(a) * r
-			local key = math.floor(x) .. "," .. math.floor(z)
-			if not bad[key] then
-				local spot = Collection:PlacementSpot(data, x, anchor.Y, z, radius, reserved)
-				if spot then return spot, key end
+	local target = hug and (1 - hug / 100) * (data.range or 15)
+	local function band(points, x, z)
+		return #points > 0 and math.floor(math.abs(Collection:PathDistance(points, x, z) - target) / 2) or 0
+	end
+	local candidates = {}
+	if line and target then
+		local base, lanes, visible = Collection:Lanes()
+		local road = visible[1] and Collection:LanePoints(base, lanes, visible[1], 1.5) or {}
+		local all = #visible > 1 and Collection:PathPoints() or nil -- one lane: a spot's distance to it is its offset
+		local at, nearest = 1, math.huge -- the sample at the slot's point
+		for i, p in road do
+			local d = (p - anchor).Magnitude
+			if d < nearest then at, nearest = i, d end
+		end
+		for i, p in road do
+			local dir = (road[math.min(i + 1, #road)] - road[math.max(i - 1, 1)]) * Vector3.new(1, 0, 1)
+			if dir.Magnitude > 0 then
+				local side = Vector3.new(-dir.Unit.Z, 0, dir.Unit.X)
+				for offset = 1, target + 12 do
+					for _, sign in { 1, -1 } do
+						local q = p + side * offset * sign
+						local b = all and band(all, q.X, q.Z) or math.floor(math.abs(offset - target) / 2)
+						table.insert(candidates, { x = q.X, y = p.Y, z = q.Z, score = b * 1e6 + math.abs(i - at) * 1.5 + offset * 0.01 })
+					end
+				end
 			end
+		end
+	else
+		local maxR = math.max(30, (target or 0) + 9)
+		local near = {}
+		for _, p in target and Collection:PathPoints() or {} do
+			if (p.X - anchor.X) ^ 2 + (p.Z - anchor.Z) ^ 2 < (maxR + 30) ^ 2 then table.insert(near, p) end
+		end
+		for r = 1.5, maxR, 1.5 do
+			local steps = math.max(8, math.floor(2 * math.pi * r / 1.5))
+			for k = 0, steps - 1 do
+				local a = 2 * math.pi * k / steps
+				local x, z = anchor.X + math.cos(a) * r, anchor.Z + math.sin(a) * r
+				table.insert(candidates, { x = x, y = anchor.Y, z = z, score = band(near, x, z) * 1000 + r })
+			end
+		end
+	end
+	table.sort(candidates, function(a, b) return a.score < b.score end)
+	for _, c in candidates do
+		local key = math.floor(c.x) .. "," .. math.floor(c.z)
+		if not bad[key] then
+			local spot = Collection:PlacementSpot(data, c.x, c.y, c.z, reserved)
+			if spot then return spot, key end
 		end
 	end
 end
@@ -1997,7 +2263,7 @@ function Collection:BuildHolograms(slots, bad, full)
 			end
 		end
 		if not pick then break end
-		local spot = Collection:FindSpot(pick.data, pick.anchor, bad, reserved)
+		local spot = Collection:FindSpot(pick.data, pick.anchor, bad, reserved, pick.hug, pick.line)
 		if spot then
 			table.insert(reserved, { pos = spot, radius = pick.data.override_hitbox_radius or 2 })
 			counts[pick.slot] += 1
@@ -2018,23 +2284,20 @@ if not IS_LOBBY then task.spawn(function()
 	local markers = {} -- slot -> ball
 	local hologramKey -- what the holograms were laid out for; rebuilt when it changes
 	local bad, refusals, full = {}, {}, {} -- refused spots, refusals in a row per unit, units at their limit
-	-- game code called from here can leave this thread without the executor's permissions; put them back each tick
-	local setIdentity = setthreadidentity or set_thread_identity
-	local identity = getthreadidentity and getthreadidentity()
 	while not closed do
 		task.wait(1)
-		if setIdentity and identity then pcall(setIdentity, identity) end
+		Collection:Elevate()
 		local ok, problem = pcall(function()
 			local placed = {}
 			for _, m in Collection:MyUnits() do
 				placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1
 			end
-			local equipped = session.profile_data.collection.equipped_units
+			local equipped = Collection:Equipped()
 			local pick, lines, slots = nil, {}, {}
 			for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 				local cfg = State.Slots[slot]
 				local uuid = equipped[slot] or equipped[tonumber(slot)]
-				local u = uuid and Collection:Owned()[uuid]
+				local u = uuid and Collection:Unit(uuid)
 				local data = u and Data.Units[u.unit_id]
 				local anchor, where
 				if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot) end
@@ -2049,13 +2312,19 @@ if not IS_LOBBY then task.spawn(function()
 
 				if data and cfg.On then
 					local count, cap = placed[uuid] or 0, math.min(cfg.Max, data.spawn_cap or cfg.Max)
+					local farm = Collection:IsFarm(u.unit_id)
 					table.insert(lines, string.format("%s %s%s: %d/%d%s", slot, Collection:UnitName(u), Collection:PlacementTag(data), count, cap,
 						anchor and (" at " .. where) or (" - " .. where)))
+					local hug = cfg.Mode == "Enemy path" and cfg.Hug or nil
+					local line = cfg.Mode == "Enemy path" and cfg.Style == "Line along road"
 					if anchor then
-						table.insert(slots, { slot = slot, uuid = uuid, u = u, data = data, count = count, cap = cap, anchor = anchor })
+						table.insert(slots, { slot = slot, uuid = uuid, u = u, data = data, count = count, cap = cap, anchor = anchor, hug = hug, line = line })
 					end
-					if anchor and not full[uuid] and count < cap and (not pick or count < pick.count) then
-						pick = { slot = slot, uuid = uuid, u = u, data = data, count = count, anchor = anchor }
+					-- fewest placed goes next; with Farms First, any farm goes before any other unit
+					local before = not pick or (State.FarmsFirst and farm and not pick.farm)
+						or ((not State.FarmsFirst or farm == pick.farm) and count < pick.count)
+					if anchor and not full[uuid] and count < cap and before then
+						pick = { slot = slot, uuid = uuid, u = u, data = data, count = count, anchor = anchor, farm = farm, hug = hug, line = line }
 					end
 				end
 			end
@@ -2077,7 +2346,7 @@ if not IS_LOBBY then task.spawn(function()
 				elseif session.collection:is_unit_on_cooldown(pick.uuid) then
 					note = "Next: " .. name .. " - on cooldown"
 				else
-					local spot, key = Collection:FindSpot(pick.data, pick.anchor, bad)
+					local spot, key = Collection:FindSpot(pick.data, pick.anchor, bad, nil, pick.hug, pick.line)
 					if not spot then
 						full[pick.uuid] = true
 						note = pick.data.hill_unit and ("No free hill spot for " .. name .. " - skipping it.")
@@ -2103,7 +2372,7 @@ if not IS_LOBBY then task.spawn(function()
 				local key, refused = { #CollectionService:GetTagged("player_units") }, 0
 				for _ in bad do refused += 1 end
 				for _, s in slots do
-					table.insert(key, string.format("%s:%d/%d%s@%.0f,%.0f", s.slot, s.count, s.cap, full[s.uuid] and "F" or "", s.anchor.X, s.anchor.Z))
+					table.insert(key, string.format("%s:%d/%d%s@%.0f,%.0f~%s", s.slot, s.count, s.cap, full[s.uuid] and "F" or "", s.anchor.X, s.anchor.Z, tostring(s.hug) .. (s.line and "L" or "C")))
 				end
 				key = table.concat(key, "|") .. "#" .. refused
 				if key ~= hologramKey then
@@ -2119,6 +2388,63 @@ if not IS_LOBBY then task.spawn(function()
 	end
 	for _, ball in markers do ball:Destroy() end
 	Collection:ClearHolograms()
+end) end
+
+-- Show Valid Spots: every 3-stud grid spot a ground unit can stand on within 30 studs of a lane, colored by distance
+-- to the road; redrawn when a lane or a unit is added
+if not IS_LOBBY then task.spawn(function()
+	local folder, drawn
+	while not closed do
+		task.wait(2)
+		local points = State.ShowSpots and Collection:PathPoints() or {}
+		local key = #points > 0 and (#points .. "|" .. #CollectionService:GetTagged("player_units")) or nil
+		if key ~= drawn then
+			drawn = key
+			if folder then folder:Destroy() folder = nil end
+			if key then
+				folder = Collection:Instance("Folder", { Name = "VaderSpots", Parent = workspace })
+				local seen = {}
+				for i, p in points do
+					for dx = -30, 30, 3 do
+						for dz = -30, 30, 3 do
+							local x, z = math.floor((p.X + dx) / 3) * 3, math.floor((p.Z + dz) / 3) * 3
+							local cell = x .. "," .. z
+							if not seen[cell] then
+								seen[cell] = true
+								local d = Collection:PathDistance(points, x, z)
+								local spot = d <= 30 and Collection:PlacementSpot({}, x, p.Y, z)
+								if spot then
+									Collection:Instance("Part", {
+										Shape = Enum.PartType.Ball, Size = Vector3.new(0.7, 0.7, 0.7), Position = spot + Vector3.new(0, 0.4, 0),
+										Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, CastShadow = false,
+										Material = Enum.Material.Neon, Color = Color3.fromHSV(0.33 * (1 - d / 30), 0.85, 1), Parent = folder,
+									})
+								end
+							end
+						end
+					end
+					if i % 5 == 0 then -- spread the raycasts over frames; turned off meanwhile = stop
+						task.wait()
+						if closed or not State.ShowSpots then break end
+					end
+				end
+			end
+		end
+	end
+	if folder then folder:Destroy() end
+end) end
+
+-- random-unit events: X the picked spells as they're handed out
+if not IS_LOBBY then task.spawn(function()
+	while not closed do
+		task.wait(0.5)
+		if State.AutoDiscard then
+			for slot, id in session.ingame_spells or {} do
+				local spell = Data.IngameSpells[id]
+				if spell and State.DiscardSpells[spell.name] then Collection:Invoke("delete_ingame_spell", slot) end
+			end
+		end
+	end
 end) end
 
 local dungeonMatchOver = false -- a dungeon room is only picked after its match ends
@@ -2186,6 +2512,16 @@ if not IS_LOBBY then task.spawn(function()
 		end)
 	end))
 
+	-- event cards: vote as soon as they're offered
+	Collection:Track(fromServer.show_roguelike_options.OnClientEvent:Connect(function(_, options)
+		if not State.AutoPickCards or type(options) ~= "table" then return end
+		local key = Collection:PickCard(options)
+		if key then
+			Collection:Invoke("select_roguelike_option", key)
+			Collection:Notify("Card: voted " .. tostring(options[key].title))
+		end
+	end))
+
 	-- vote start after a countdown, leaving time to place units or cancel
 	task.spawn(function()
 		local countdown, lastVote = nil, 0
@@ -2249,6 +2585,7 @@ if not IS_LOBBY then task.spawn(function()
 				MacroStatus:SetDesc(string.format("%s / %s -> %s", tostring(Collection:CurrentMode()), tostring(Collection:MapKey()),
 					loaded and (loaded .. " (" .. Collection:MacroSummary(steps) .. ")") or "no macro"))
 			end
+			macroPending = State.PlayMacro and not State.RecordMacro and i <= #steps
 			if i > #steps then
 				if #steps > 0 and not finished then
 					finished = true
@@ -2305,15 +2642,17 @@ if not IS_LOBBY then task.spawn(function()
 		local lastAbility = 0
 		while not closed do
 			task.wait(1)
-			if State.AutoUpgrade and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
+			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
 				local best, bestPicked
 				for _, m in Collection:MyUnits() do
 					local cost = Collection:UpgradeCost(m)
 					if cost then
-						local u = Collection:Owned()[m._stats.uuid.Value] or {}
+						local u = Collection:Unit(m._stats.uuid.Value) or {}
 						local picked = u.unit_id and State.UpgradeFirst[Collection:UnitName(u)] == true
-						if not best or (picked and not bestPicked) or (picked == bestPicked and cost < best.cost) then
-							best, bestPicked = { model = m, cost = cost }, picked
+						local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
+							or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
+						if not best or (picked and not bestPicked) or (picked == bestPicked and score > best.score) then
+							best, bestPicked = { model = m, cost = cost, score = score }, picked
 						end
 					end
 				end
@@ -2325,7 +2664,11 @@ if not IS_LOBBY then task.spawn(function()
 				for _, m in Collection:MyUnits() do
 					local ok, activeId = pcall(Core.UnitServiceCore.get_active_id, m)
 					local attack = ok and activeId and Data.Attacks[activeId]
-					if attack and not (attack.custom_client_script and attack.custom_client_script.active_start) then
+					-- the game's own auto-active check, so a recorded ability step is a real cast, not a 3s retry
+					local st = m._stats
+					local ready = st:FindFirstChild("active_attack_cooldown") and st:FindFirstChild("last_active_cast")
+						and st.active_attack_cooldown.Value - (tick() - st.last_active_cast.Value) <= 0
+					if attack and ready and not (attack.custom_client_script and attack.custom_client_script.active_start) then
 						Collection:Invoke("use_active_attack", m)
 					end
 				end
