@@ -25,6 +25,7 @@ local State = {
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {},
 	AutoAbility = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
+	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
 	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true,
 	Slots = {}, -- slot id -> { On, Mode, Percent, Max }
@@ -228,7 +229,17 @@ function Collection:ListMacros()
 	table.sort(names)
 	return names
 end
-function Collection:LoadMacro(name) return name and Collection:ReadJson(Collection:MacroPath(name), {}).steps or {} end
+function Collection:LoadMacro(name)
+	local steps = name and Collection:ReadJson(Collection:MacroPath(name), {}).steps or {}
+	-- older macros saved the recorder's uuid, which no other account has: swap in the unit id and save
+	local converted = false
+	for _, step in steps do
+		local u = step.uuid and Collection:Owned()[step.uuid]
+		if u then step.unit_id, step.uuid, converted = u.unit_id, nil, true end
+	end
+	if converted then Collection:SaveMacro(name, steps) end
+	return steps
+end
 function Collection:SaveMacro(name, steps) Collection:WriteJson(Collection:MacroPath(name), { steps = steps }) end
 
 function Collection:CurrentMode()
@@ -254,14 +265,26 @@ function Collection:ActiveMacroName()
 	return State.MacroName
 end
 
+-- your copy of a macro's unit: an equipped one with that unit id, the least placed copy first
+function Collection:MacroUnit(unitId)
+	local placed = {}
+	for _, m in Collection:MyUnits() do placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1 end
+	local best
+	for _, uuid in session.profile_data.collection.equipped_units do
+		local u = Collection:Owned()[uuid]
+		if u and u.unit_id == unitId and (not best or (placed[uuid] or 0) < (placed[best] or 0)) then best = uuid end
+	end
+	return best
+end
+
 -- which recorded spawn a unit model came from: same unit, closest to where it was placed
 function Collection:SpawnIndexOf(steps, model)
 	local st = typeof(model) == "Instance" and model:FindFirstChild("_stats")
-	local uuid = st and st:FindFirstChild("uuid") and st.uuid.Value
-	if not uuid then return nil end
+	local u = st and st:FindFirstChild("uuid") and Collection:Owned()[st.uuid.Value]
+	if not u then return nil end
 	local pos, best, bestDist = model:GetPivot().Position, nil, math.huge
 	for i, step in steps do
-		if step.type == "spawn" and step.uuid == uuid then
+		if step.type == "spawn" and step.unit_id == u.unit_id then
 			local d = Vector2.new(step.cf[1] - pos.X, step.cf[3] - pos.Z).Magnitude
 			if d < bestDist then best, bestDist = i, d end
 		end
@@ -281,7 +304,8 @@ function Collection.RecordingInvoke(name, ...)
 	local step
 	if action == "spawn" then
 		local uuid, cf = ...
-		step = { type = action, wave = Collection:Wave(), uuid = uuid, cf = { cf:GetComponents() } }
+		local u = Collection:Owned()[uuid]
+		step = u and { type = action, wave = Collection:Wave(), unit_id = u.unit_id, cf = { cf:GetComponents() } }
 	elseif action then
 		-- resolve the unit before the call: a sold unit is gone afterwards
 		local index = Collection:SpawnIndexOf(recording, (...))
@@ -777,6 +801,17 @@ SellSection:AddSlider("SellWave", {
 	Callback = function(value) State.SellWave = value end,
 })
 
+local LeaveSection = Tabs.Match:AddSection("Leave")
+LeaveSection:AddToggle("LobbyAtWave", {
+	Title = "Teleport To Lobby At Wave", Default = false,
+	Description = "Goes back to the lobby once the match reaches the wave below, after Teleport Delay.",
+	Callback = function(value) State.LobbyAtWave = value end,
+})
+LeaveSection:AddSlider("LobbyWave", {
+	Title = "Lobby At Wave", Default = 30, Min = 1, Max = 200, Rounding = 0,
+	Callback = function(value) State.LobbyWave = value end,
+})
+
 --------------------------- [[ Auto Play Tab ]] ---------------------------
 
 local PlaceSection = Tabs.AutoPlay:AddSection("Auto Place")
@@ -952,6 +987,77 @@ MacroManage:AddButton({
 				{ Title = "Cancel" },
 			},
 		})
+	end,
+})
+
+local MacroInstall = Tabs.Macro:AddSection("Share")
+MacroInstall:AddInput("MacroLink", {
+	Title = "Link Or JSON", Placeholder = "https://...json or pasted macro JSON", Default = "", Finished = false,
+})
+-- a shared macro from a link or pasted JSON: its steps and saved name, or nil and why
+function Collection:ReadSharedMacro(text)
+	local isLink = text:match("^https?://") ~= nil
+	if not isLink and text:sub(1, 1) ~= "{" then return nil, "Paste a link that starts with https:// or a macro's JSON." end
+	local body = text
+	if isLink then
+		local ok, result = pcall(game.HttpGet, game, text)
+		if not ok then return nil, "Download failed: " .. tostring(result) end
+		body = result
+	end
+	local decoded, data = pcall(HttpService.JSONDecode, HttpService, body)
+	if not decoded or type(data) ~= "table" or type(data.steps) ~= "table" then
+		return nil, isLink and "That link isn't a macro file. Discord links expire after a day; copy a fresh one."
+			or "That JSON isn't a macro. Paste everything Export copied."
+	end
+	return data.steps, data.name or (isLink and text:match("([^/?#]+)%.json"))
+end
+function Collection:InstallMacro(name, steps)
+	Collection:SaveMacro(name, steps)
+	steps = Collection:LoadMacro(name) -- converts old uuid steps when the units are yours
+	local stale = 0
+	for _, step in steps do
+		if step.type == "spawn" and not step.unit_id then stale += 1 end
+	end
+	Collection:RefreshMacroLists()
+	VaderUI.Options.MacroName:SetValue(name)
+	Collection:Notify("Installed " .. name .. " - " .. Collection:MacroSummary(steps))
+	if stale > 0 then
+		Collection:Notify(stale .. " spawns were saved by an older hub version and will be skipped. Ask the sender to load it once in this version and share it again.")
+	end
+end
+MacroInstall:AddButton({
+	Title = "Install Macro",
+	Description = "Installs a shared macro under the Name above, or its own name when Name is empty.",
+	Callback = function() task.spawn(function()
+		local text = (VaderUI.Options.MacroLink.Value:gsub("^%s+", ""):gsub("%s+$", ""))
+		local steps, sharedName = Collection:ReadSharedMacro(text)
+		if not steps then return Collection:Notify(sharedName) end
+		local name = Collection:CleanMacroName(VaderUI.Options.MacroNewName.Value)
+		if name == "" then name = Collection:CleanMacroName(sharedName) end
+		if name == "" then name = "Macro" end
+		if not (canPersist and isfile(Collection:MacroPath(name))) then return Collection:InstallMacro(name, steps) end
+		Window:Dialog({
+			Title = "Replace macro?",
+			Content = name .. " already exists. Replace it with the downloaded one?",
+			Buttons = {
+				{ Title = "Replace", Callback = function() Collection:InstallMacro(name, steps) end },
+				{ Title = "Cancel" },
+			},
+		})
+	end) end,
+})
+MacroInstall:AddButton({
+	Title = "Export Selected Macro",
+	Description = "Copies the picked macro's JSON to the clipboard.",
+	Callback = function()
+		local name = State.MacroName
+		if not name then return Collection:Notify("Pick a macro to export.") end
+		local copy = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+		local steps = Collection:LoadMacro(name) -- old uuid steps become unit ids first
+		if type(copy) ~= "function" or not pcall(copy, HttpService:JSONEncode({ name = name, steps = steps })) then
+			return Collection:Notify("Couldn't copy to the clipboard.")
+		end
+		Collection:Notify("Copied " .. name .. " - " .. Collection:MacroSummary(steps))
 	end,
 })
 
@@ -2022,7 +2128,7 @@ if not IS_LOBBY then task.spawn(function()
 	local matchStart = os.time()
 	local startChallenge = (Collection:RefreshChallenge() or {}).current_uuid
 	local gameStarted = workspace._DATA.GameStarted
-	local soldThisMatch = false
+	local soldThisMatch, leaving = false, false
 
 	Collection:Track(fromServer.start_vote_wave_skip.OnClientEvent:Connect(function()
 		if State.AutoSkip then Collection:Invoke("vote_wave_skip") end
@@ -2034,6 +2140,16 @@ if not IS_LOBBY then task.spawn(function()
 			soldThisMatch = true
 			for _, m in Collection:MyUnits() do Collection:Invoke("sell_unit_ingame", m) end
 			Collection:Notify("Sold all units at wave " .. wave)
+		end
+		if State.LobbyAtWave and not leaving and wave >= State.LobbyWave then
+			leaving = true
+			task.spawn(function()
+				if Collection:TeleportDelay("Back to the lobby at wave " .. wave, function() return State.LobbyAtWave end) then
+					Collection:Invoke("teleport_back_to_lobby")
+				else
+					leaving = false -- cancelled: the next wave tries again if it's turned back on
+				end
+			end)
 		end
 	end))
 
@@ -2105,13 +2221,13 @@ if not IS_LOBBY then task.spawn(function()
 			end
 		end
 		-- the unit a playback spawn produced: same unit, nearest to the recorded spot
-		local function spawnedModel(step)
+		local function spawnedModel(uuid, step)
 			local pos = Vector3.new(step.cf[1], step.cf[2], step.cf[3])
 			local t0 = os.clock()
 			repeat
 				local best, bestDist
 				for _, m in Collection:MyUnits() do
-					if not taken[m] and m._stats.uuid.Value == step.uuid then
+					if not taken[m] and m._stats.uuid.Value == uuid then
 						local d = (m:GetPivot().Position - pos).Magnitude
 						if not bestDist or d < bestDist then best, bestDist = m, d end
 					end
@@ -2141,20 +2257,21 @@ if not IS_LOBBY then task.spawn(function()
 			elseif State.PlayMacro and not State.RecordMacro then
 				local step = steps[i]
 				local spawnStep = step.type == "spawn" and step or steps[step.unit]
-				local u = spawnStep and Collection:Owned()[spawnStep.uuid]
+				local name = spawnStep and spawnStep.unit_id and Collection:UnitName(spawnStep) or "?"
+				local uuid = step.type == "spawn" and step.unit_id and Collection:MacroUnit(step.unit_id)
 				local m = step.unit and models[step.unit]
 				local function status(note)
-					MacroStatus:SetDesc(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, u and Collection:UnitName(u) or "?", note))
+					MacroStatus:SetDesc(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, name, note))
 				end
-				if not u then
-					MacroStatus:SetDesc(string.format("Step %d/%d skipped: unit isn't in your collection", i, #steps))
+				if step.type == "spawn" and not uuid then
+					MacroStatus:SetDesc(string.format("Step %d/%d skipped: %s isn't on your team", i, #steps, name))
 					advance()
 				elseif step.type == "spawn" then
-					local cost = session.collection:get_upgraded_unit_data(u.unit_id).cost * Core.UnitServiceCore.calculate_spawn_cost_multiplier(session)
+					local cost = session.collection:get_upgraded_unit_data(step.unit_id).cost * Core.UnitServiceCore.calculate_spawn_cost_multiplier(session)
 					if Collection:Money() < cost then
 						status("waiting for " .. math.ceil(cost) .. "¥")
-					elseif Collection:Invoke("spawn_unit", step.uuid, CFrame.new(table.unpack(step.cf))) then
-						models[i] = spawnedModel(step)
+					elseif Collection:Invoke("spawn_unit", uuid, CFrame.new(table.unpack(step.cf))) then
+						models[i] = spawnedModel(uuid, step)
 						advance()
 					else
 						retry("server refused the spawn")
