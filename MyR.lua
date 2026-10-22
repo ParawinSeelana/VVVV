@@ -1921,7 +1921,12 @@ if IS_LOBBY then
 					Collection:RefreshEventStatus()
 				end
 				if pad then
-					task.wait(20)
+					-- let the pad's own countdown (60s stages, 30s challenges) and the teleport finish; 120s caps a stuck pad
+					local t0, timer, tele = os.clock(), pad:FindFirstChild("Timer"), pad:FindFirstChild("Teleporting")
+					while not closed and Collection:InPad() and os.clock() - t0 < 120
+						and (os.clock() - t0 < 20 or (timer and timer.Value > 0) or (tele and tele.Value)) do
+						task.wait(1)
+					end
 					-- still here: the start didn't go through, free the pad and try again
 					if not closed and Collection:InPad() then Collection:Invoke("request_leave_lobby", pad.Name) end
 				end
