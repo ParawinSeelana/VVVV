@@ -593,6 +593,12 @@ local Tabs = {
 	Settings = Window:AddTab({ Title = "Settings" }),
 }
 
+-- VaderUI sizes these canvases from a changed signal that errors (lacking capability Plugin) once a hub thread has
+-- called game code, which left the pages with nothing to scroll; let the engine size them instead
+Collection:Elevate()
+for _, tab in Tabs do tab.Page.AutomaticCanvasSize = Enum.AutomaticSize.Y end
+VaderUI.GUI.Window.Main.Tabs.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
 --------------------------- [[ Main Tab ]] ---------------------------
 
 local JoinSection = Tabs.Main:AddSection("Auto Join")
