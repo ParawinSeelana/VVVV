@@ -11,6 +11,7 @@ local State = {
 	-- lobby
 	Join = {}, Stage = {}, Difficulty = "Normal", FriendsOnly = false,
 	AutoJoinChallenge = false, Loadout = "Don't change", TeleportDelay = 0,
+	AutoMansion = false, MansionDifficulty = "Normal",
 	-- event
 	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
 	AutoDiscard = false, DiscardSpells = {},
@@ -22,15 +23,16 @@ local State = {
 	DungeonPickBy = "Rewards, then weakness", DungeonLookahead = true,
 	DungeonRoomOrder = {}, DungeonWeakOrder = {}, DungeonShopOrder = {},
 	-- macro
-	MacroName = nil, AutoSwitchMacro = false,
+	MacroName = nil, AutoSwitchMacro = false, MacroSlotSpots = false,
 	-- match
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {}, UpgradeOrder = "Cheapest first",
-	AutoAbility = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
+	AutoAbility = false, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
 	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true, FarmsFirst = false, ShowSpots = false,
-	Slots = {}, -- slot id -> { On, Mode, Percent, Max }
+	PlaceDistance = 50, FarmPlaceDistance = 50,
+	Slots = {}, -- slot id -> { On, Mode, Max }
 	-- summon
 	AutoSummon = false, Banner = nil, SummonPay = "Gems x10", KeepGems = 0,
 	-- traits
@@ -225,7 +227,7 @@ end
 
 -- wraps the game's own endpoint wrapper so actions done by hand are captured
 local MACRO_ACTIONS = { spawn_unit = "spawn", upgrade_unit_ingame = "upgrade", sell_unit_ingame = "sell", use_active_attack = "ability" }
-local MACRO_MODES = { "Story", "Infinite", "Legend", "Raid", "Challenge", "Event", "Contract" }
+local MACRO_MODES = { "Story", "Infinite", "Legend", "Raid", "Challenge", "Event", "Contract", "Infinity Mansion" }
 local originalInvoke = Client.EndpointsClient.invoke_server
 local assignments = Collection:ReadJson(macroAssignPath, {}) -- "Mode|map" -> macro name
 local recording, recordTarget -- steps recorded this match and the macro they go into
@@ -265,6 +267,7 @@ function Collection:CurrentMode()
 	local d = Loader.LevelData
 	if not d then return nil end
 	if d._event_contract then return "Contract" end
+	if d._gamemode == "infinite_tower" then return "Infinity Mansion" end
 	if d._challenge or d.id == "__DAILY_CHALLENGE" then return "Challenge" end
 	if d._is_event_challenge or d._roguelike_mode then return "Event" end
 	local w = d.world and Data.Worlds[d.world]
@@ -325,7 +328,7 @@ function Collection.RecordingInvoke(name, ...)
 		local uuid, cf = ...
 		local u = Collection:Unit(uuid)
 		step = u and { type = action, wave = Collection:Wave(), unit_id = u.unit_id, cf = { cf:GetComponents() } }
-	elseif action then
+	elseif action and not (action == "ability" and Collection:IsBuffUnit((...))) then -- buff units are Loop Buffs' job
 		-- resolve the unit before the call: a sold unit is gone afterwards
 		local index = Collection:SpawnIndexOf(recording, (...))
 		step = index and { type = action, wave = Collection:Wave(), unit = index }
@@ -585,6 +588,7 @@ local Tabs = {
 	Dungeon = Window:AddTab({ Title = "Dungeon" }),
 	Match = Window:AddTab({ Title = "Match" }),
 	AutoPlay = Window:AddTab({ Title = "Auto Play" }),
+	Ability = Window:AddTab({ Title = "Ability" }),
 	Macro = Window:AddTab({ Title = "Macro" }),
 	Summon = Window:AddTab({ Title = "Summon" }),
 	Traits = Window:AddTab({ Title = "Traits & Stats" }),
@@ -604,8 +608,7 @@ VaderUI.GUI.Window.Main.Tabs.AutomaticCanvasSize = Enum.AutomaticSize.Y
 local JoinSection = Tabs.Main:AddSection("Auto Join")
 local JoinStatus = JoinSection:AddParagraph({
 	Title = "Status",
-	Content = IS_LOBBY and "Idle. With several modes on, tries Challenge, Raid, Legend, Story, then Infinite."
-		or "In a match - joining runs in the lobby.",
+	Content = IS_LOBBY and "Idle." or "In a match - joining runs in the lobby.",
 })
 JoinSection:AddToggle("FriendsOnly", {
 	Title = "Friends Only", Default = false,
@@ -613,20 +616,20 @@ JoinSection:AddToggle("FriendsOnly", {
 })
 JoinSection:AddDropdown("Loadout", {
 	Title = "Team Loadout", Values = loadoutValues, Default = "Don't change", Multi = false,
-	Description = "Loaded once before auto join starts a stage.",
+	Description = "Set before joining.",
 	Callback = function(value) State.Loadout = value end,
 })
 JoinSection:AddSlider("TeleportDelay", {
 	Title = "Teleport Delay (seconds)", Default = 0, Min = 0, Max = 60, Rounding = 0,
-	Description = "Waits this long before anything that sends you to another place: starting a stage, challenge or contract, entering a dungeon room, replay / next votes and going back to the lobby. Turning that feature off during the wait cancels it.",
+	Description = "Wait before any teleport.",
 	Callback = function(value) State.TeleportDelay = value end,
 })
 
 local MODE_INFO = {
 	Story = "Story acts.",
-	Infinite = "Infinite mode. Always Hard.",
-	Legend = "Legend stages. Always Hard.",
-	Raid = "Raids. Always Hard. Skipped when it can't start, e.g. no tries left.",
+	Infinite = "Always Hard.",
+	Legend = "Always Hard.",
+	Raid = "Always Hard. Skips if no tries.",
 }
 for _, mode in MODES do
 	local section = Tabs.Main:AddSection(mode)
@@ -649,13 +652,25 @@ end
 local ChallengeSection = Tabs.Main:AddSection("Challenge")
 ChallengeSection:AddToggle("AutoJoinChallenge", {
 	Title = "Auto Join Challenge", Default = false,
-	Description = "In the lobby: joins the rotating challenge first if you haven't cleared it.",
+	Description = "Joins the challenge first if not cleared.",
 	Callback = function(value) State.AutoJoinChallenge = value end,
 })
 ChallengeSection:AddToggle("LeaveOnChallenge", {
 	Title = "Leave When Challenge Changes", Default = false,
-	Description = "In a match: goes back to lobby when a new rotating challenge starts.",
+	Description = "Leaves when a new challenge starts.",
 	Callback = function(value) State.LeaveOnChallenge = value end,
+})
+
+local MansionSection = Tabs.Main:AddSection("Infinity Mansion")
+MansionSection:AddToggle("AutoMansion", {
+	Title = "Auto Join Infinity Mansion", Default = false,
+	Description = "Next uncleared room, then Next Room / Retry.",
+	Callback = function(value) State.AutoMansion = value end,
+})
+MansionSection:AddDropdown("MansionDifficulty", {
+	Title = "Difficulty", Values = { "Normal", "Hard" }, Default = "Normal", Multi = false,
+	Description = "Hard needs room 100 last season.",
+	Callback = function(value) State.MansionDifficulty = value end,
 })
 
 --------------------------- [[ Event Tab ]] ---------------------------
@@ -671,12 +686,12 @@ Collection:RefreshEventStatus()
 local EventStageSection = Tabs.Event:AddSection("Event Stage")
 EventStageSection:AddToggle("AutoJoinEvent", {
 	Title = "Auto Join", Default = false,
-	Description = "In the lobby: joins the event stage on the event pads (April Fools right now).",
+	Description = "Joins the event stage.",
 	Callback = function(value) State.AutoJoinEvent = value end,
 })
 EventStageSection:AddDropdown("EventJoinBy", {
 	Title = "Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
-	Description = "Normal starts it on your own, like Play Solo. Matchmaking queues with other players; turning Auto Join off leaves the queue.",
+	Description = "Normal = solo. Matchmaking = queue.",
 	Callback = function(value) State.EventJoinBy = value end,
 })
 
@@ -684,12 +699,12 @@ EventStageSection:AddDropdown("EventJoinBy", {
 local CardSection = Tabs.Event:AddSection("Event Cards")
 CardSection:AddToggle("AutoPickCards", {
 	Title = "Auto Pick Cards", Default = false,
-	Description = "When the event offers cards, votes for the one highest in Card Priority.",
+	Description = "Votes by Card Priority.",
 	Callback = function(value) State.AutoPickCards = value end,
 })
 Collection:AddPriorityList(CardSection, "CardPriority", {
 	Title = "Card Priority",
-	Description = "Top first, judged by the card's main effect. Unticked kinds are never picked; if every card offered is unticked, the game decides.",
+	Description = "Top first. Unticked = never.",
 	Rows = 8,
 	Entries = {
 		{ id = "stat:damage", label = "Attack" },
@@ -724,24 +739,24 @@ table.sort(spellNames)
 local SpellSection = Tabs.Event:AddSection("Event Spells")
 SpellSection:AddToggle("AutoDiscard", {
 	Title = "Auto Discard", Default = false,
-	Description = "In events that hand out random units: presses the X on the picked spells as soon as you get them, so a new unit or spell comes in.",
+	Description = "Discards picked spells.",
 	Callback = function(value) State.AutoDiscard = value end,
 })
 SpellSection:AddDropdown("DiscardSpells", {
 	Title = "Discard Spells", Values = spellNames, Multi = true, Default = {},
-	Description = "Spells you keep stay in their slot until you use them.",
+	Description = "Unpicked spells are kept.",
 	Callback = function(value) State.DiscardSpells = value end,
 })
 
 local ContractSection = Tabs.Event:AddSection("Event Contracts")
 ContractSection:AddToggle("AutoContract", {
 	Title = "Auto Contract", Default = false,
-	Description = "In the lobby: opens a contract portal and starts it. After a contract match: votes the next contract.",
+	Description = "Starts and votes contracts.",
 	Callback = function(value) State.AutoContract = value end,
 })
 ContractSection:AddDropdown("ContractWeakTo", {
 	Title = "Weak To", Values = { "Physical", "Magic" }, Multi = true, Default = { "Physical", "Magic" },
-	Description = "Only contracts weak to a picked damage type. Both picked allows either; none picked allows any.",
+	Description = "None picked = any.",
 	Callback = function(value) State.ContractWeakTo = value end,
 })
 ContractSection:AddDropdown("ContractTierMode", {
@@ -750,12 +765,12 @@ ContractSection:AddDropdown("ContractTierMode", {
 })
 ContractSection:AddSlider("ContractMaxTier", {
 	Title = "Max Tier", Min = 1, Max = 30, Default = 10, Rounding = 0,
-	Description = "Used with \"Highest up to Max Tier\".",
+	Description = "For Highest up to Max Tier.",
 	Callback = function(value) State.ContractMaxTier = value end,
 })
 ContractSection:AddToggle("SkipCompletedContracts", {
 	Title = "Skip Completed Contracts", Default = true,
-	Description = "A completed contract gives no extra rewards until it rotates.",
+	Description = "No rewards until it rotates.",
 	Callback = function(value) State.SkipCompletedContracts = value end,
 })
 
@@ -766,7 +781,7 @@ EventShopSection:AddDropdown("EventShopItems", {
 })
 EventShopSection:AddToggle("AutoEventShop", {
 	Title = "Auto Buy", Default = false,
-	Description = "Buys the picked items whenever you have enough event currency.",
+	Description = "Buys picked items when affordable.",
 	Callback = function(value) State.AutoEventShop = value end,
 })
 
@@ -812,17 +827,17 @@ local DungeonSection = Tabs.Dungeon:AddSection("Dungeon Run")
 local DungeonStatus = DungeonSection:AddParagraph({ Title = "Status", Content = "-" })
 DungeonSection:AddToggle("AutoDungeon", {
 	Title = "Auto Dungeon", Default = false,
-	Description = "Picks rooms, buys from shops, handles chests and shrines, and continues after a death. In a match it waits for the match to end before picking.",
+	Description = "Runs the whole dungeon.",
 	Callback = function(value) State.AutoDungeon = value end,
 })
 DungeonSection:AddToggle("DungeonStart", {
 	Title = "Auto Start Run", Default = false,
-	Description = "In the lobby: starts a run with a Dungeon Run Key when none is going. Turns itself off when a run can't start.",
+	Description = "Starts a run with a key.",
 	Callback = function(value) State.DungeonStart = value end,
 })
 DungeonSection:AddDropdown("DungeonChests", {
 	Title = "Open Chests", Values = { "Save for the end", "At every checkpoint" }, Default = "Save for the end", Multi = false,
-	Description = "Rare Chests opened after the boss room can drop a Secret unit.",
+	Description = "After the boss: Secret unit chance.",
 	Callback = function(value) State.DungeonChests = value end,
 })
 DungeonSection:AddDropdown("DungeonShrine", {
@@ -837,24 +852,24 @@ RoomSection:AddDropdown("DungeonPickBy", {
 })
 RoomSection:AddToggle("DungeonLookahead", {
 	Title = "Look One Room Ahead", Default = true,
-	Description = "Adds half the best reward score of the rooms each choice leads to.",
+	Description = "Counts rooms one step ahead.",
 	Callback = function(value) State.DungeonLookahead = value end,
 })
 Collection:AddPriorityList(RoomSection, "DungeonRoomOrder", {
 	Title = "Rewards", Entries = roomEntries, Rows = #roomEntries,
-	Description = "On: wanted, higher counts more. Off: avoided.",
+	Description = "Higher = wanted more. Off = avoided.",
 	Callback = function(value) State.DungeonRoomOrder = value end,
 })
 Collection:AddPriorityList(RoomSection, "DungeonWeakOrder", {
 	Title = "Weak Against", Entries = weakEntries, Rows = #weakEntries,
-	Description = "Prefers rooms whose enemies take extra damage from the types that are on, higher counts more. Off: ignored.",
+	Description = "Prefers enemies weak to these.",
 	Callback = function(value) State.DungeonWeakOrder = value end,
 })
 
 local DungeonShopSection = Tabs.Dungeon:AddSection("Shop Priority")
 Collection:AddPriorityList(DungeonShopSection, "DungeonShopOrder", {
 	Title = "Items", Entries = shopEntries,
-	Description = "Buys the highest item on the list that the shop has and you can afford, one at a time, until none fit. Off: never bought.",
+	Description = "Top first. Off = never.",
 	Callback = function(value) State.DungeonShopOrder = value end,
 })
 
@@ -864,7 +879,7 @@ local MatchSection = Tabs.Match:AddSection("Match")
 local MatchStatus = MatchSection:AddParagraph({ Title = "Status", Content = IS_LOBBY and "In the lobby." or "Waiting..." })
 MatchSection:AddToggle("AutoStart", {
 	Title = "Auto Vote Start", Default = false,
-	Description = "Counts down from Start Delay, then votes start. Turn it off during the countdown to cancel.",
+	Description = "Votes start after Start Delay.",
 	Callback = function(value) State.AutoStart = value end,
 })
 MatchSection:AddSlider("StartDelay", {
@@ -877,7 +892,7 @@ MatchSection:AddToggle("AutoSkip", {
 })
 MatchSection:AddDropdown("EndAction", {
 	Title = "When Match Ends", Values = { "Nothing", "Replay", "Next Stage", "Lobby" }, Default = "Nothing", Multi = false,
-	Description = "Next Stage falls back to Replay outside story mode.",
+	Description = "Next Stage = Replay outside story.",
 	Callback = function(value) State.EndAction = value end,
 })
 
@@ -894,7 +909,7 @@ SellSection:AddSlider("SellWave", {
 local LeaveSection = Tabs.Match:AddSection("Leave")
 LeaveSection:AddToggle("LobbyAtWave", {
 	Title = "Teleport To Lobby At Wave", Default = false,
-	Description = "Goes back to the lobby once the match reaches the wave below, after Teleport Delay.",
+	Description = "Leaves at the wave below.",
 	Callback = function(value) State.LobbyAtWave = value end,
 })
 LeaveSection:AddSlider("LobbyWave", {
@@ -908,27 +923,37 @@ local PlaceSection = Tabs.AutoPlay:AddSection("Auto Place")
 local PlaceStatus = PlaceSection:AddParagraph({ Title = "Status", Content = IS_LOBBY and "In the lobby." or "Waiting..." })
 PlaceSection:AddToggle("AutoPlace", {
 	Title = "Auto Place", Default = false,
-	Description = "Places the slots that are on around each slot's own point: one of each unit, then second copies, and so on, slot order breaking ties. Waits for money, and pauses while Play Macro is on.",
+	Description = "Places each slot at its point. Pauses for Play Macro.",
 	Callback = function(value) State.AutoPlace = value end,
 })
 PlaceSection:AddToggle("FarmsFirst", {
 	Title = "Farms First", Default = false,
-	Description = "Places money units (C.E.O., Bulby) before everything else, so income starts early.",
+	Description = "Money units first.",
 	Callback = function(value) State.FarmsFirst = value end,
+})
+PlaceSection:AddSlider("PlaceDistance", {
+	Title = "Placement Distance %", Default = 50, Min = 0, Max = 100, Rounding = 0,
+	Description = "0 = enemy spawn, 100 = your base.",
+	Callback = function(value) State.PlaceDistance = value end,
+})
+PlaceSection:AddSlider("FarmPlaceDistance", {
+	Title = "Farm Placement Distance %", Default = 50, Min = 0, Max = 100, Rounding = 0,
+	Description = "Same, for money units.",
+	Callback = function(value) State.FarmPlaceDistance = value end,
 })
 PlaceSection:AddToggle("ShowHolograms", {
 	Title = "Show Holograms", Default = true,
-	Description = "See-through copies of your units on the exact spots Auto Place will use, in order, tagged slot·copy. On your screen only.",
+	Description = "Shows planned spots.",
 	Callback = function(value) State.ShowHolograms = value end,
 })
 PlaceSection:AddToggle("ShowPlacePoint", {
 	Title = "Show Placement Points", Default = true,
-	Description = "A numbered glowing ball at each slot's point, on your screen only.",
+	Description = "Ball at each slot's point.",
 	Callback = function(value) State.ShowPlacePoint = value end,
 })
 PlaceSection:AddToggle("ShowSpots", {
 	Title = "Show Valid Spots", Default = false,
-	Description = "A dot on every spot a ground unit can stand within 30 studs of the enemy path: green by the road, yellow mid-range, red 30 studs back. On your screen only.",
+	Description = "Dots where units can stand.",
 	Callback = function(value) State.ShowSpots = value end,
 })
 
@@ -949,7 +974,7 @@ function Collection:SetSlotPosition(slot)
 end
 
 for _, slot in Data.GameplaySettings.UNIT_SLOTS do
-	local cfg = { On = true, Mode = "Enemy path", Percent = 50, Max = 6, Hug = 100, Style = "Line along road" }
+	local cfg = { On = true, Mode = "Enemy path", Max = 6 }
 	State.Slots[slot] = cfg
 	local equipped = Collection:Equipped()
 	local u = Collection:Unit(equipped[slot] or equipped[tonumber(slot)] or "")
@@ -964,37 +989,22 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 		Title = "Place Around", Values = { "Enemy path", "My position" }, Default = "Enemy path", Multi = false,
 		Callback = function(value) cfg.Mode = value end,
 	})
-	section:AddSlider("Slot" .. slot .. "Percent", {
-		Title = "Path Point (% from enemy spawn)", Default = 50, Min = 0, Max = 100, Rounding = 0,
-		Description = "0 is where enemies spawn, 100 is your base. Used with Enemy path.",
-		Callback = function(value) cfg.Percent = value end,
-	})
-	section:AddSlider("Slot" .. slot .. "Hug", {
-		Title = "Path Hug (%)", Default = 100, Min = 0, Max = 100, Rounding = 0,
-		Description = "How close to the road: 100 lines the road edge, lower stands further back, 0 at the edge of the unit's range. Used with Enemy path.",
-		Callback = function(value) cfg.Hug = value end,
-	})
-	section:AddDropdown("Slot" .. slot .. "Style", {
-		Title = "Placing Style", Values = { "Line along road", "Cluster at point" }, Default = "Line along road", Multi = false,
-		Description = "Line along road: copies line up beside the road both ways from the Path Point, as far as needed. Cluster at point: copies gather within 30 studs of it. Used with Enemy path.",
-		Callback = function(value) cfg.Style = value end,
-	})
 	section:AddSlider("Slot" .. slot .. "Max", {
 		Title = "Max Placed", Default = 6, Min = 1, Max = 6, Rounding = 0,
-		Description = cap and ("This unit can be placed " .. cap .. " time" .. (cap == 1 and "" or "s") .. " at most.") or nil,
+		Description = cap and ("Max " .. cap .. ".") or nil,
 		Callback = function(value) cfg.Max = value end,
 	})
 	section:AddButton({
 		Title = "Set Position Here",
-		Description = "Saves where your character stands as this slot's spot on this map and switches it to My position.",
+		Description = "Saves your spot for this map.",
 		Callback = function() Collection:SetSlotPosition(slot) end,
 	})
 end
 
-local UpgradeSection = Tabs.AutoPlay:AddSection("Upgrade & Abilities")
+local UpgradeSection = Tabs.AutoPlay:AddSection("Upgrade")
 UpgradeSection:AddToggle("AutoUpgrade", {
 	Title = "Auto Upgrade", Default = false,
-	Description = "Upgrade First picks, then by Upgrade Order. Waits while a macro is playing, then takes over once it finishes.",
+	Description = "Waits for the macro to finish.",
 	Callback = function(value) State.AutoUpgrade = value end,
 })
 UpgradeSection:AddDropdown("UpgradeFirst", {
@@ -1003,17 +1013,27 @@ UpgradeSection:AddDropdown("UpgradeFirst", {
 })
 UpgradeSection:AddDropdown("UpgradeOrder", {
 	Title = "Upgrade Order", Values = { "Cheapest first", "Farms first", "Strongest first" }, Default = "Cheapest first", Multi = false,
-	Description = "For everything not in Upgrade First, e.g. the random units in event stages. Farms first upgrades money units before the rest; Strongest first keeps feeding your highest-damage unit.",
+	Description = "For units not in Upgrade First.",
 	Callback = function(value) State.UpgradeOrder = value end,
 })
 UpgradeSection:AddToggle("PlaceBeforeUpgrading", {
 	Title = "Place Before Upgrading", Default = true,
-	Description = "With Auto Place on, upgrades wait until every slot is placed, so money adds up to the next placement.",
+	Description = "Upgrades wait for Auto Place.",
 	Callback = function(value) State.PlaceBeforeUpgrade = value end,
 })
-UpgradeSection:AddToggle("AutoAbility", {
+--------------------------- [[ Ability Tab ]] ---------------------------
+
+local AbilitySection = Tabs.Ability:AddSection("Abilities")
+AbilitySection:AddToggle("AutoAbility", {
 	Title = "Auto Use Abilities", Default = false,
+	Description = "Skips buff units.",
 	Callback = function(value) State.AutoAbility = value end,
+})
+local BuffSection = Tabs.Ability:AddSection("Buffs")
+BuffSection:AddToggle("LoopBuffs", {
+	Title = "Loop Buffs", Default = false,
+	Description = "Buff units take turns. Keep game Auto off.",
+	Callback = function(value) State.LoopBuffs = value end,
 })
 
 --------------------------- [[ Macro Tab ]] ---------------------------
@@ -1022,12 +1042,12 @@ local MacroMain = Tabs.Macro:AddSection("Macro")
 MacroStatus = MacroMain:AddParagraph({ Title = "Status", Content = IS_LOBBY and "In the lobby." or "Waiting for the match..." })
 MacroMain:AddDropdown("MacroName", {
 	Title = "Macro", Values = Collection:ListMacros(), Multi = false,
-	Description = "Recorded into and played. With Auto Switch on, an assignment for this game mode and map wins.",
+	Description = "Auto Switch overrides this.",
 	Callback = function(value) State.MacroName = value end,
 })
 MacroMain:AddToggle("RecordMacro", {
 	Title = "Record Macro", Default = false,
-	Description = "Records your spawns, upgrades, sells and abilities. Replaces the macro's steps once your first action lands; with no macro picked it creates Mode_map.",
+	Description = "Records your actions, not buff units.",
 	Callback = function(value)
 		State.RecordMacro = value
 		recording, recordTarget = value and {} or nil, nil
@@ -1035,8 +1055,13 @@ MacroMain:AddToggle("RecordMacro", {
 })
 MacroMain:AddToggle("PlayMacro", {
 	Title = "Play Macro", Default = false,
-	Description = "Replays in order. Spawns and upgrades wait for money; sells and abilities wait for their recorded wave.",
+	Description = "Waits for money and waves.",
 	Callback = function(value) State.PlayMacro = value end,
+})
+MacroMain:AddToggle("MacroSlotSpots", {
+	Title = "Place At Auto Play Points", Default = false,
+	Description = "Spawns at Auto Play points.",
+	Callback = function(value) State.MacroSlotSpots = value end,
 })
 
 local MacroManage = Tabs.Macro:AddSection("Manage")
@@ -1062,7 +1087,7 @@ MacroManage:AddButton({
 })
 MacroManage:AddButton({
 	Title = "Rename Selected Macro",
-	Description = "Renames the picked macro to the name above. Its assignments follow it.",
+	Description = "Assignments follow it.",
 	Callback = function()
 		local old = State.MacroName
 		if not old then return Collection:Notify("Pick a macro to rename.") end
@@ -1142,7 +1167,7 @@ function Collection:InstallMacro(name, steps)
 end
 MacroInstall:AddButton({
 	Title = "Install Macro",
-	Description = "Installs a shared macro under the Name above, or its own name when Name is empty.",
+	Description = "Uses Name, or its own.",
 	Callback = function() task.spawn(function()
 		local text = (VaderUI.Options.MacroLink.Value:gsub("^%s+", ""):gsub("%s+$", ""))
 		local steps, sharedName = Collection:ReadSharedMacro(text)
@@ -1163,7 +1188,7 @@ MacroInstall:AddButton({
 })
 MacroInstall:AddButton({
 	Title = "Export Selected Macro",
-	Description = "Copies the picked macro's JSON to the clipboard.",
+	Description = "Copies JSON to clipboard.",
 	Callback = function()
 		local name = State.MacroName
 		if not name then return Collection:Notify("Pick a macro to export.") end
@@ -1190,7 +1215,7 @@ end
 Collection:RefreshAssignList()
 MacroSwitch:AddToggle("AutoSwitchMacro", {
 	Title = "Switch Macro By Game Mode & Map", Default = false,
-	Description = "Each match uses the macro assigned to its game mode and map, then its game mode on Any map.",
+	Description = "Per game mode and map.",
 	Callback = function(value) State.AutoSwitchMacro = value end,
 })
 MacroSwitch:AddDropdown("AssignMode", { Title = "Game Mode", Values = MACRO_MODES, Default = "Story", Multi = false })
@@ -1202,7 +1227,7 @@ function Collection:AssignKey()
 end
 MacroSwitch:AddButton({
 	Title = "Use Current Match",
-	Description = "Fills Game Mode and Map from the match you're in.",
+	Description = "From this match.",
 	Callback = function()
 		if not Collection:CurrentMode() then return Collection:Notify("Join a match first.") end
 		VaderUI.Options.AssignMode:SetValue(Collection:CurrentMode())
@@ -1260,7 +1285,7 @@ SummonSection:AddInput("KeepGems", {
 })
 SummonSection:AddToggle("AutoSummon", {
 	Title = "Auto Summon", Default = false,
-	Description = "Stops at your gem reserve, when storage is full, or when a summon doesn't go through.",
+	Description = "Stops at reserve or full storage.",
 	Callback = function(value) State.AutoSummon = value end,
 })
 
@@ -1273,7 +1298,7 @@ for _, rarity in SELL_RARITIES do
 end
 AutoSellSection:AddDropdown("AutoSellRarities", {
 	Title = "Auto-Sell Summoned", Values = SELL_RARITIES, Multi = true, Default = currentAutosell,
-	Description = "Uses the game's own auto-sell for newly summoned units.",
+	Description = "Game's auto-sell.",
 	Callback = function(picked)
 		for _, rarity in SELL_RARITIES do
 			local name = "autosell_" .. rarity:lower()
@@ -1352,7 +1377,7 @@ TraitSection:AddDropdown("RerollPay", {
 })
 TraitSection:AddToggle("ProtectMythic", {
 	Title = "Protect Mythic Traits", Default = true,
-	Description = "Stop instead of rerolling away a Mythic trait you didn't pick.",
+	Description = "Keeps unpicked Mythics.",
 	Callback = function(value) State.ProtectMythic = value end,
 })
 
@@ -1405,7 +1430,7 @@ end
 
 TraitSection:AddToggle("AutoTraitReroll", {
 	Title = "Auto Trait Reroll", Default = false,
-	Description = "Rolls until a picked trait or out of currency. Never uses the Robux reroll.",
+	Description = "Rolls until a picked trait. No Robux.",
 	Callback = function(on)
 		if not on then traitRunning = false return end
 		if traitRunning then return end
@@ -1493,7 +1518,7 @@ StatSection:AddDropdown("StatMode", {
 })
 StatSection:AddDropdown("StatTarget", {
 	Title = "Stop At Rank (or better)", Values = RANKS, Default = "S", Multi = false,
-	Description = "For All stats, every stat must reach it.",
+	Description = "All stats: every stat.",
 	Callback = function(value) State.StatTarget = value end,
 })
 
@@ -1617,7 +1642,7 @@ local Performance = Tabs.Misc:AddSection("Performance")
 local LOW_GRAPHICS = { "low_quality", "low_quality_textures", "low_quality_shadows", "disable_effects", "disable_other_fx", "disable_kill_fx" }
 Performance:AddToggle("LowGraphics", {
 	Title = "Low Graphics (more FPS)", Default = false,
-	Description = "Uses the game's own low quality and effect settings.",
+	Description = "Game's low quality.",
 	Callback = function(value)
 		-- Ignore the initial "off" so the player's own game settings are left alone.
 		if not value and not State.LowGraphics then return end
@@ -1650,7 +1675,7 @@ function Collection:ApplyHideName()
 end
 Privacy:AddToggle("HideName", {
 	Title = "Hide My Name, Guild & Level", Default = false,
-	Description = "Hides them on your overhead, on your screen only. Other players still see them.",
+	Description = "Your screen only.",
 	Callback = function(value)
 		State.HideName = value
 		Collection:ApplyHideName()
@@ -1856,6 +1881,24 @@ function Collection:JoinContract()
 	return created, "Contract: starting " .. tostring(contract.name)
 end
 
+-- Infinity Mansion: the next room you haven't cleared, like the game's Start button. A started room teleports during the
+-- wait; still here after it means the start didn't go through, so other modes get their turn
+function Collection:JoinMansion()
+	local tower = (session.profile_data.level_data or {}).infinite_tower
+	local room = tower and tower.floor_reached or 1
+	local difficulty = State.MansionDifficulty
+	if difficulty == "Hard" and not Core.InfiniteTowerServiceCore.has_unlocked_difficulty(session, room, "Hard") then
+		return nil, "Infinity Mansion: Hard is locked."
+	end
+	if not Collection:TeleportDelay("Starting Infinity Mansion room " .. room, function() return State.AutoMansion end) then
+		return nil, "Infinity Mansion: start cancelled."
+	end
+	Collection:Invoke("request_start_infinite_tower", room, difficulty)
+	JoinStatus:SetDesc(string.format("Infinity Mansion: starting room %d (%s)...", room, difficulty))
+	task.wait(15)
+	return nil, string.format("Infinity Mansion: room %d (%s) didn't start.", room, difficulty)
+end
+
 function Collection:AnyModeOn()
 	for _, on in State.Join do
 		if on then return true end
@@ -1899,7 +1942,7 @@ if IS_LOBBY then
 		task.wait(5)
 		while not closed do
 			-- an auto dungeon run (or one about to start) has the lobby to itself
-			if (State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or Collection:AnyModeOn()) and not Collection:InPad()
+			if (State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
 				and not (State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)) then
 				local pad, msg
 				local notes = {}
@@ -1907,6 +1950,7 @@ if IS_LOBBY then
 					{ State.AutoJoinChallenge, Collection.JoinChallenge },
 					{ State.AutoContract, Collection.JoinContract },
 					{ State.AutoJoinEvent, Collection.JoinEvent },
+					{ State.AutoMansion, Collection.JoinMansion },
 				} do
 					if pad then break end
 					if try[1] then
@@ -1956,6 +2000,20 @@ function Collection:MyUnits()
 	return list
 end
 
+-- the buff an active ability gives allies ({ name, time } from the attack data), or nil when it isn't a buff
+function Collection:BuffOf(attack)
+	for _, aoe in attack and attack.aoe or {} do
+		local buff = aoe.hit_allies and aoe.hit and aoe.hit.buffs and aoe.hit.buffs[1]
+		if buff then return buff end
+	end
+end
+
+-- a buff unit: its active ability buffs allies (Commander, Elfy, Windsong...)
+function Collection:IsBuffUnit(m)
+	local ok, id = pcall(Core.UnitServiceCore.get_active_id, m)
+	return ok and id ~= nil and Collection:BuffOf(Data.Attacks[id]) ~= nil
+end
+
 function Collection:UpgradeCost(m)
 	local ok, info, isMax = pcall(Client.GUIService.get_next_upgrade_info, m, Collection:Unit(m._stats.uuid.Value) or {})
 	if ok and info and not isMax then return math.ceil(info.cost * Core.UnitServiceCore.calculate_upgrade_cost_multiplier(m, session)) end
@@ -1998,8 +2056,9 @@ end
 local placePending = false -- Auto Place still has units to put down; Place Before Upgrading holds upgrades meanwhile
 local macroPending = false -- Play Macro still has steps left; Auto Upgrade waits so the macro gets the money
 
--- a slot's point: a spot along the first enemy lane, or the position saved for this map and slot
-function Collection:PlaceAnchor(slot)
+-- a slot's point: a spot along the first enemy lane at Placement Distance (Farm Placement Distance for money units),
+-- or the position saved for this map and slot
+function Collection:PlaceAnchor(slot, unitId)
 	local cfg = State.Slots[slot]
 	if cfg.Mode == "My position" then
 		local p = placePositions[tostring(Collection:MapKey()) .. "|" .. slot]
@@ -2010,8 +2069,9 @@ function Collection:PlaceAnchor(slot)
 	if not lanes then return nil, "enemy path not loaded yet" end
 	local lane = visible[1]
 	if not lane then return nil, "no enemy path on this map" end
-	local _, _, position = Core.PathService.get_path_position_by_distance_from_spawn(base, lane, lanes[lane].total_distance * cfg.Percent / 100)
-	return position, cfg.Percent .. "% of the path"
+	local percent = Collection:IsFarm(unitId) and State.FarmPlaceDistance or State.PlaceDistance
+	local _, _, position = Core.PathService.get_path_position_by_distance_from_spawn(base, lane, lanes[lane].total_distance * percent / 100)
+	return position, percent .. "% of the path"
 end
 
 -- the map's enemy lanes: the base, the game's path cache, and the visible lane folders by name
@@ -2099,9 +2159,14 @@ function Collection:PlacementSpot(data, x, y, z, reserved)
 	for _, m in workspace._UNITS:GetChildren() do
 		local box = m:FindFirstChild("_hitbox")
 		if box and CollectionService:HasTag(m, "player_units") then
-			local rel = box.CFrame:PointToObjectSpace(hit.Position)
-			local inside = box.Shape == Enum.PartType.Ball and Vector2.new(rel.X, rel.Z).Magnitude < box.Size.X / 2
-				or math.abs(rel.X) < box.Size.X / 2 and math.abs(rel.Z) < box.Size.Z / 2
+			-- placed units get an upright cylinder (Size = height, diameter, diameter); overrides can be a ball or a block
+			local inside
+			if box.Shape == Enum.PartType.Block then
+				local rel = box.CFrame:PointToObjectSpace(Vector3.new(hit.Position.X, box.Position.Y, hit.Position.Z))
+				inside = math.abs(rel.X) < box.Size.X / 2 and math.abs(rel.Z) < box.Size.Z / 2
+			else
+				inside = Vector2.new(box.Position.X - hit.Position.X, box.Position.Z - hit.Position.Z).Magnitude < box.Size.Z / 2
+			end
 			if inside then return nil end
 		end
 	end
@@ -2129,9 +2194,10 @@ function Collection:HillPoints(anchor)
 	return points
 end
 
--- a free spot for a unit. With hug (Path Hug %), spots at (100 - hug)% of the unit's range from the road come first,
--- in 2-stud bands. line (Placing Style "Line along road") takes spots beside the first lane, nearest the anchor along
--- the road, as far as it runs; otherwise rings within 30 studs, nearest the anchor. Candidates are 1.5 studs apart so
+-- a free spot for a unit, the nearest to its target: the anchor, at (100 - hug)% of the unit's range from the road
+-- when hug is given (100 on the enemy path: the road edge). Both count in studs (2-stud bands), so copies pack in a
+-- tight group instead of running down the road. line (slots on the enemy path) takes spots beside the first lane;
+-- otherwise rings within 30 studs of the anchor. Candidates are 1.5 studs apart so
 -- units pack as tight as PlacementSpot allows. Hill units can only stand on hills, so they search the hill parts
 -- instead. bad holds spots the server refused
 function Collection:FindSpot(data, anchor, bad, reserved, hug, line)
@@ -2167,7 +2233,7 @@ function Collection:FindSpot(data, anchor, bad, reserved, hug, line)
 					for _, sign in { 1, -1 } do
 						local q = p + side * offset * sign
 						local b = all and band(all, q.X, q.Z) or math.floor(math.abs(offset - target) / 2)
-						table.insert(candidates, { x = q.X, y = p.Y, z = q.Z, score = b * 1e6 + math.abs(i - at) * 1.5 + offset * 0.01 })
+						table.insert(candidates, { x = q.X, y = p.Y, z = q.Z, score = b * 2 + math.abs(i - at) * 1.5 + offset * 0.01 })
 					end
 				end
 			end
@@ -2183,7 +2249,7 @@ function Collection:FindSpot(data, anchor, bad, reserved, hug, line)
 			for k = 0, steps - 1 do
 				local a = 2 * math.pi * k / steps
 				local x, z = anchor.X + math.cos(a) * r, anchor.Z + math.sin(a) * r
-				table.insert(candidates, { x = x, y = anchor.Y, z = z, score = band(near, x, z) * 1000 + r })
+				table.insert(candidates, { x = x, y = anchor.Y, z = z, score = band(near, x, z) * 2 + r })
 			end
 		end
 	end
@@ -2264,7 +2330,7 @@ local hologramFolder
 function Collection:BuildHolograms(slots, bad, full)
 	if hologramFolder then hologramFolder:Destroy() end
 	hologramFolder = Collection:Instance("Folder", { Name = "VaderHolograms", Parent = workspace })
-	local counts, skip, reserved = {}, {}, {}
+	local counts, skip, reserved, spread = {}, {}, {}, {} -- spread: slot -> farthest planned spot from its point
 	for _, s in slots do counts[s.slot] = s.count end
 	for _ = 1, 36 do
 		local pick
@@ -2279,9 +2345,47 @@ function Collection:BuildHolograms(slots, bad, full)
 			table.insert(reserved, { pos = spot, radius = pick.data.override_hitbox_radius or 2 })
 			counts[pick.slot] += 1
 			Collection:Hologram(pick, spot, counts[pick.slot], hologramFolder)
+			spread[pick.slot] = math.max(spread[pick.slot] or 0, Vector2.new(spot.X - pick.anchor.X, spot.Z - pick.anchor.Z).Magnitude)
 		else
 			skip[pick.slot] = true
 		end
+		task.wait() -- one spot search a frame, so a rebuild doesn't freeze the game
+	end
+	-- each slot's area: a see-through disc around its point covering its placed units and planned spots, with a pin
+	-- on every other spot in it the unit can stand on
+	local units = Collection:MyUnits()
+	for _, s in slots do
+		local radius = spread[s.slot] or 0
+		for _, m in units do
+			if m._stats.uuid.Value == s.uuid then
+				local p = m:GetPivot().Position
+				radius = math.max(radius, Vector2.new(p.X - s.anchor.X, p.Z - s.anchor.Z).Magnitude)
+			end
+		end
+		-- ponytail: 6-15 studs with pins 3 apart keeps it to ~80 ground checks a slot; reaching every unit lagged the game
+		radius = math.clamp(radius + 3, 6, 15)
+		placeRay.FilterDescendantsInstances = { workspace:FindFirstChild("_terrain") }
+		local ground = workspace:Raycast(s.anchor + Vector3.new(0, 40, 0), Vector3.new(0, -120, 0), placeRay)
+		Collection:Instance("Part", {
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, radius * 2, radius * 2), Anchored = true,
+			CanCollide = false, CanQuery = false, CanTouch = false, CastShadow = false, Material = Enum.Material.Neon,
+			Color = HOLOGRAM_COLOR, Transparency = 0.8, Parent = hologramFolder,
+			CFrame = CFrame.new(Vector3.new(s.anchor.X, (ground and ground.Position.Y or s.anchor.Y) + 0.1, s.anchor.Z)) * CFrame.Angles(0, 0, math.pi / 2),
+		})
+		for dx = -radius, radius, 3 do
+			for dz = -radius, radius, 3 do
+				local spot = dx * dx + dz * dz <= radius * radius and Collection:PlacementSpot(s.data, s.anchor.X + dx, s.anchor.Y, s.anchor.Z + dz, reserved)
+				if spot then
+					Collection:Instance("Part", {
+						Shape = Enum.PartType.Cylinder, Size = Vector3.new(1.2, 0.4, 0.4), Anchored = true,
+						CanCollide = false, CanQuery = false, CanTouch = false, CastShadow = false, Material = Enum.Material.Neon,
+						Color = Color3.new(1, 1, 1), Transparency = 0.3, Parent = hologramFolder,
+						CFrame = CFrame.new(spot + Vector3.new(0, 0.6, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+					})
+				end
+			end
+		end
+		task.wait() -- spread the raycasts over frames
 	end
 end
 
@@ -2311,7 +2415,7 @@ if not IS_LOBBY then task.spawn(function()
 				local u = uuid and Collection:Unit(uuid)
 				local data = u and Data.Units[u.unit_id]
 				local anchor, where
-				if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot) end
+				if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot, u.unit_id) end
 
 				if anchor and State.ShowPlacePoint then
 					markers[slot] = markers[slot] or Collection:PlaceMarker(slot)
@@ -2326,8 +2430,9 @@ if not IS_LOBBY then task.spawn(function()
 					local farm = Collection:IsFarm(u.unit_id)
 					table.insert(lines, string.format("%s %s%s: %d/%d%s", slot, Collection:UnitName(u), Collection:PlacementTag(data), count, cap,
 						anchor and (" at " .. where) or (" - " .. where)))
-					local hug = cfg.Mode == "Enemy path" and cfg.Hug or nil
-					local line = cfg.Mode == "Enemy path" and cfg.Style == "Line along road"
+					-- on the enemy path copies always pack along the road edge
+					local line = cfg.Mode == "Enemy path"
+					local hug = line and 100 or nil
 					if anchor then
 						table.insert(slots, { slot = slot, uuid = uuid, u = u, data = data, count = count, cap = cap, anchor = anchor, hug = hug, line = line })
 					end
@@ -2511,6 +2616,13 @@ if not IS_LOBBY then task.spawn(function()
 					return
 				end
 			end
+			-- Infinity Mansion: the game's own Next Room (won) / Retry (lost) button
+			if Loader.LevelData._gamemode == "infinite_tower" and State.AutoMansion then
+				if Collection:TeleportDelay(results.victory and "Next room" or "Retrying the room", function() return State.AutoMansion end) then
+					Collection:Invoke("request_start_infinite_tower_from_game")
+				end
+				return
+			end
 			local action = State.EndAction
 			if action == "Nothing" or not Collection:TeleportDelay(action, function() return State.EndAction == action end) then return end
 			if action == "Replay" then
@@ -2557,7 +2669,7 @@ if not IS_LOBBY then task.spawn(function()
 	-- macro playback
 	task.spawn(function()
 		local loaded, steps, finished = false, {}, false
-		local models, taken = {}, {}
+		local models, taken, bad = {}, {}, {} -- bad: slot-point spots the server refused
 		local i, tries = 1, 0
 		local function advance() i, tries = i + 1, 0 end
 		local function retry(why)
@@ -2567,9 +2679,24 @@ if not IS_LOBBY then task.spawn(function()
 				advance()
 			end
 		end
-		-- the unit a playback spawn produced: same unit, nearest to the recorded spot
-		local function spawnedModel(uuid, step)
-			local pos = Vector3.new(step.cf[1], step.cf[2], step.cf[3])
+		-- Place At Auto Play Points: a free spot around the unit's slot point, placed like Auto Place does; nil when
+		-- the slot has no point or no free spot, so the recorded spot is used
+		local function slotPlacement(uuid, unitId)
+			local equipped = Collection:Equipped()
+			for _, slot in Data.GameplaySettings.UNIT_SLOTS do
+				if (equipped[slot] or equipped[tonumber(slot)]) == uuid then
+					local cfg, anchor = State.Slots[slot], Collection:PlaceAnchor(slot, unitId)
+					if not anchor then return nil end
+					local path = cfg.Mode == "Enemy path"
+					local spot, key = Collection:FindSpot(Data.Units[unitId], anchor, bad, nil, path and 100 or nil, path)
+					if not spot then return nil end
+					local pos = spot + Vector3.new(0, Collection:UnitHalfHeight(unitId), 0)
+					return CFrame.lookAt(pos, Vector3.new(anchor.X, pos.Y, anchor.Z)), key
+				end
+			end
+		end
+		-- the unit a playback spawn produced: same unit, nearest to where it was placed
+		local function spawnedModel(uuid, pos)
 			local t0 = os.clock()
 			repeat
 				local best, bestDist
@@ -2618,11 +2745,17 @@ if not IS_LOBBY then task.spawn(function()
 					local cost = session.collection:get_upgraded_unit_data(step.unit_id).cost * Core.UnitServiceCore.calculate_spawn_cost_multiplier(session)
 					if Collection:Money() < cost then
 						status("waiting for " .. math.ceil(cost) .. "¥")
-					elseif Collection:Invoke("spawn_unit", uuid, CFrame.new(table.unpack(step.cf))) then
-						models[i] = spawnedModel(uuid, step)
-						advance()
 					else
-						retry("server refused the spawn")
+						local cf, key
+						if State.MacroSlotSpots then cf, key = slotPlacement(uuid, step.unit_id) end
+						cf = cf or CFrame.new(table.unpack(step.cf))
+						if Collection:Invoke("spawn_unit", uuid, cf) then
+							models[i] = spawnedModel(uuid, cf.Position)
+							advance()
+						else
+							if key then bad[key] = true end
+							retry("server refused the spawn")
+						end
 					end
 				elseif not (m and m.Parent) then
 					MacroStatus:SetDesc(string.format("Step %d/%d skipped: its unit isn't on the map", i, #steps))
@@ -2638,6 +2771,8 @@ if not IS_LOBBY then task.spawn(function()
 					else
 						retry("server refused the upgrade")
 					end
+				elseif step.type == "ability" and Collection:IsBuffUnit(m) then
+					advance() -- buff units are Loop Buffs' job
 				elseif Collection:Wave() < step.wave then
 					status("waiting for wave " .. step.wave)
 				else
@@ -2651,6 +2786,16 @@ if not IS_LOBBY then task.spawn(function()
 	-- upgrade, abilities
 	task.spawn(function()
 		local lastAbility = 0
+		local pendingBuff = {} -- active id -> true while a Loop Buffs recast is scheduled, and 1s after it lands
+		-- how long each buff really lasts, from the server's own buff messages: upgrades and traits change it per player
+		local buffTimes = {} -- active id -> seconds
+		Collection:Track(fromServer.buff_on.OnClientEvent:Connect(function(_, _, _, params)
+			local caster = type(params) == "table" and params.attacker_unit
+			if typeof(caster) == "Instance" and type(params.buff_time) == "number" then
+				local ok, id = pcall(Core.UnitServiceCore.get_active_id, caster)
+				if ok and id then buffTimes[id] = params.buff_time end
+			end
+		end))
 		while not closed do
 			task.wait(1)
 			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
@@ -2670,17 +2815,51 @@ if not IS_LOBBY then task.spawn(function()
 				if best and Collection:Money() >= best.cost then Collection:Invoke("upgrade_unit_ingame", best.model) end
 			end
 
-			if State.AutoAbility and os.clock() - lastAbility > 3 then
-				lastAbility = os.clock()
-				for _, m in Collection:MyUnits() do
-					local ok, activeId = pcall(Core.UnitServiceCore.get_active_id, m)
-					local attack = ok and activeId and Data.Attacks[activeId]
-					-- the game's own auto-active check, so a recorded ability step is a real cast, not a 3s retry
-					local st = m._stats
-					local ready = st:FindFirstChild("active_attack_cooldown") and st:FindFirstChild("last_active_cast")
-						and st.active_attack_cooldown.Value - (tick() - st.last_active_cast.Value) <= 0
-					if attack and ready and not (attack.custom_client_script and attack.custom_client_script.active_start) then
-						Collection:Invoke("use_active_attack", m)
+			local abilityDue = State.AutoAbility and os.clock() - lastAbility > 3
+			if abilityDue then lastAbility = os.clock() end
+			local buffs = {} -- active id -> { time, cooldown, lastCast, loopers }: one per buff unit, read each tick
+			for _, m in Collection:MyUnits() do
+				local ok, activeId = pcall(Core.UnitServiceCore.get_active_id, m)
+				local attack = ok and activeId and Data.Attacks[activeId]
+				-- the game's own auto-active check, so a recorded ability step is a real cast, not a 3s retry
+				local st = m._stats
+				local since = st:FindFirstChild("last_active_cast") and tick() - st.last_active_cast.Value
+				local cd = st:FindFirstChild("active_attack_cooldown")
+				local ready = since and cd and cd.Value - since <= 0
+				local buff = Collection:BuffOf(attack)
+				if buff and since and cd then
+					local g = buffs[activeId] or { time = buffTimes[activeId] or buff.time, cooldown = 0, lastCast = -math.huge, loopers = {} }
+					buffs[activeId] = g
+					g.cooldown = math.max(g.cooldown, cd.Value)
+					g.lastCast = math.max(g.lastCast, st.last_active_cast.Value)
+					-- the game's own Auto casts it the moment it's ready, so the loop leaves it be
+					if not m:GetAttribute("_auto_active") then
+						table.insert(g.loopers, { m = m, readyAt = st.last_active_cast.Value + cd.Value })
+					end
+				end
+				if abilityDue and attack and ready and not buff -- buff units are Loop Buffs' job
+					and not (attack.custom_client_script and attack.custom_client_script.active_start) then
+					Collection:Invoke("use_active_attack", m)
+				end
+			end
+			-- Loop Buffs: the copies take turns spread evenly over the cooldown (4 copies of a 64s cooldown: one every 16s), so
+			-- each caster still holds the last buff when it casts and every unit gets recast right around its buff ending.
+			-- Never closer than half a buff apart, or casts would land on units still holding one. All timings are read live.
+			local now = tick()
+			for id, g in buffs do
+				if State.LoopBuffs and #g.loopers > 0 and not pendingBuff[id] then
+					local spacing = math.max(g.cooldown / #g.loopers, (g.time + 0.3) / 2)
+					table.sort(g.loopers, function(a, b) return a.readyAt < b.readyAt end)
+					local pick = g.loopers[1] -- the copy that's waited longest
+					local at = math.max(g.lastCast + spacing, pick.readyAt + 0.05, now)
+					if at - now < 1.2 then
+						pendingBuff[id] = true
+						task.delay(at - now, function()
+							if not closed and State.LoopBuffs and pick.m.Parent then Collection:Invoke("use_active_attack", pick.m) end
+							-- the cast can take a moment to show in last_active_cast; until then the next turn reads as due
+							task.wait(1)
+							pendingBuff[id] = nil
+						end)
 					end
 				end
 			end
@@ -3119,7 +3298,7 @@ end
 local AFK = Tabs.Settings:AddSection("Anti-AFK")
 AFK:AddToggle("AntiAFK", {
 	Title = "Anti-AFK", Default = true,
-	Description = "Prevent idle disconnections while the UI is open.",
+	Description = "No idle kick.",
 	Callback = function(value) antiAFK = value end,
 })
 Collection:Track(Players.LocalPlayer.Idled:Connect(function()
@@ -3138,7 +3317,7 @@ secCommunity:AddParagraph({
 })
 secCommunity:AddButton({
 	Title = "Copy Discord Invite",
-	Description = "Copy the Discord invite to your clipboard.",
+	Description = "Copies the invite.",
 	Callback = function()
 		local copy = setclipboard or toclipboard or (Clipboard and Clipboard.set)
 		if type(copy) == "function" then
