@@ -9,13 +9,13 @@ local Env = (getgenv and getgenv()) or _G
 
 local State = {
 	-- lobby
-	Join = {}, Stage = {}, Difficulty = "Normal", FriendsOnly = false,
-	AutoJoinChallenge = false, AutoJoinDailyChallenge = false, Loadout = "Don't change", TeleportDelay = 0,
+	Join = {}, Stage = {}, JoinBy = {}, Difficulty = "Normal", FriendsOnly = false,
+	AutoJoinChallenge = false, AutoJoinDailyChallenge = false, DailyJoinBy = "Normal", Loadout = "Don't change", TeleportDelay = 0,
 	AutoMansion = false, MansionDifficulty = "Normal",
 	-- event
 	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
 	AutoDiscard = false, DiscardSpells = {},
-	AutoContract = false, ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
+	AutoContract = false, ContractJoinBy = "Normal", ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
 	AutoEventShop = false, EventShopItems = {},
 	-- dungeon
@@ -210,6 +210,7 @@ local placePositions = Collection:ReadJson(placePositionsPath, {}) -- "map|slot"
 -- same embed as the Kaitun's
 local httpRequest = request or http_request or (syn and syn.request)
 local WebhookIcon = "https://github.com/DONUT6599/ddgdhdf/blob/main/Asset_1.png?raw=true"
+local WebhookRN = "https://tr.rbxcdn.com/180DAY-ceec97df50507c3436e05dfca16cd467/256/256/Image/png/noFilter"
 
 function Collection:Comma(amount)
 	local formatted = tostring(math.floor(tonumber(amount) or 0))
@@ -247,8 +248,8 @@ function Collection:Webhook(kind, title, lines)
 					description = "Username : " .. LP.Name .. "\n" .. table.concat(lines, "\n"),
 					footer = { text = "VaderHug", icon_url = WebhookIcon },
 					timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-					image = avatar and { url = avatar } or nil,
-					thumbnail = { url = WebhookIcon },
+					image = avatar and { url = WebhookRN } or nil,
+					thumbnail = { url = avatar },
 				} },
 			}),
 		})
@@ -673,6 +674,11 @@ for _, mode in MODES do
 		Title = mode == "Infinite" and "World" or "Stage", Values = stages[mode].labels, Multi = false,
 		Callback = function(value) State.Stage[mode] = value end,
 	})
+	section:AddDropdown(mode .. "JoinBy", {
+		Title = "Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
+		Description = "Matchmaking only where the game offers it, else solo.",
+		Callback = function(value) State.JoinBy[mode] = value end,
+	})
 	if mode == "Story" then
 		section:AddDropdown("Difficulty", {
 			Title = "Difficulty", Values = { "Normal", "Hard" }, Default = "Normal", Multi = false,
@@ -686,6 +692,11 @@ ChallengeSection:AddToggle("AutoJoinDailyChallenge", {
 	Title = "Auto Join Daily Challenge", Default = false,
 	Description = "Joins the daily challenge once per reset, before everything else.",
 	Callback = function(value) State.AutoJoinDailyChallenge = value end,
+})
+ChallengeSection:AddDropdown("DailyJoinBy", {
+	Title = "Daily Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
+	Description = "Normal = solo. Matchmaking = queue.",
+	Callback = function(value) State.DailyJoinBy = value end,
 })
 ChallengeSection:AddToggle("AutoJoinChallenge", {
 	Title = "Auto Join Challenge", Default = false,
@@ -790,6 +801,11 @@ ContractSection:AddToggle("AutoContract", {
 	Title = "Auto Contract", Default = false,
 	Description = "Starts and votes contracts.",
 	Callback = function(value) State.AutoContract = value end,
+})
+ContractSection:AddDropdown("ContractJoinBy", {
+	Title = "Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
+	Description = "Normal = open a portal. Matchmaking = queue.",
+	Callback = function(value) State.ContractJoinBy = value end,
 })
 ContractSection:AddDropdown("ContractWeakTo", {
 	Title = "Weak To", Values = { "Physical", "Magic" }, Multi = true, Default = { "Physical", "Magic" },
@@ -1905,6 +1921,25 @@ function Collection:FreePad(folder)
 	end
 end
 
+-- queue like the Matchmaking button; the queue holds the lobby loop until it ends, active() going false leaves it
+function Collection:Matchmake(level, label, name, active)
+	if not Collection:TeleportDelay("Matchmaking " .. name, active) then
+		return nil, label .. ": matchmaking cancelled."
+	end
+	Collection:Invoke("request_matchmaking", level)
+	JoinStatus:SetDesc(label .. ": matchmaking for " .. name .. "...")
+	local queue, t0 = LP.PlayerGui:FindFirstChild("MatchmakingUI"), os.clock()
+	while not closed and (os.clock() - t0 < 5 or (queue and queue.Enabled)) do
+		if not active() then
+			Collection:Invoke("leave_matchmaking")
+			return nil, label .. ": left matchmaking."
+		end
+		task.wait(1)
+	end
+	task.wait(10) -- a match found teleports us during this
+	return nil, label .. ": matchmaking ended without a match."
+end
+
 -- daily = the once-a-day challenge on _CHALLENGES.DailyChallenge, else the half-hourly one
 function Collection:JoinChallenge(daily)
 	local c = daily and Collection:Invoke("get_daily_challenge") or Collection:RefreshChallenge()
@@ -1912,6 +1947,9 @@ function Collection:JoinChallenge(daily)
 	if type(c) ~= "table" or c.current_uuid == done then return nil end
 	local name, toggle = daily and "daily challenge" or "challenge", daily and "AutoJoinDailyChallenge" or "AutoJoinChallenge"
 	local level = daily and type(c.current_level) == "table" and c.current_level.name or c.current_level_id
+	if daily and State.DailyJoinBy == "Matchmaking" then
+		return Collection:Matchmake("__DAILY_CHALLENGE", "Daily challenge", tostring(level), function() return State[toggle] end)
+	end
 	local folder = workspace:FindFirstChild("_CHALLENGES") and workspace._CHALLENGES:FindFirstChild(daily and "DailyChallenge" or "Challenges")
 	for _, pad in folder and folder:GetChildren() or {} do
 		local tele, players = pad:FindFirstChild("Teleporting"), pad:FindFirstChild("Players")
@@ -1937,22 +1975,7 @@ function Collection:JoinEvent()
 	if not level then return nil, "Event: no event pad in this lobby." end
 	local name = Data.Levels[level] and Data.Levels[level].name or level
 	if State.EventJoinBy == "Matchmaking" then
-		if not Collection:TeleportDelay("Matchmaking " .. name, function() return State.AutoJoinEvent end) then
-			return nil, "Event: matchmaking cancelled."
-		end
-		Collection:Invoke("request_matchmaking", level)
-		JoinStatus:SetDesc("Event: matchmaking for " .. name .. "...")
-		-- the queue holds the lobby loop until it ends; turning Auto Join off leaves it
-		local queue, t0 = LP.PlayerGui:FindFirstChild("MatchmakingUI"), os.clock()
-		while not closed and (os.clock() - t0 < 5 or (queue and queue.Enabled)) do
-			if not State.AutoJoinEvent then
-				Collection:Invoke("leave_matchmaking")
-				return nil, "Event: left matchmaking."
-			end
-			task.wait(1)
-		end
-		task.wait(10) -- a match found teleports us during this
-		return nil, "Event: matchmaking ended without a match."
+		return Collection:Matchmake(level, "Event", name, function() return State.AutoJoinEvent end)
 	end
 	local pad = Collection:FreePad(folder)
 	if not pad then return nil, "Event: no free pad." end
@@ -2016,6 +2039,9 @@ end
 function Collection:JoinContract()
 	local key, contract = Collection:PickContract()
 	if not key then return nil, "Contract: none open (all completed?)." end
+	if State.ContractJoinBy == "Matchmaking" then
+		return Collection:Matchmake(contract.id, "Contract", tostring(contract.name), function() return State.AutoContract end)
+	end
 	local created
 	local conn = fromServer.portal_lobby_owner_created.OnClientEvent:Connect(function(pad) created = pad end)
 	local opened = Collection:Invoke("open_event_contract_portal", key)
@@ -2064,6 +2090,10 @@ function Collection:JoinStage(mode)
 	if State.Loadout ~= "Don't change" and not loadoutLoaded then
 		loadoutLoaded = true
 		Collection:Invoke("load_team_loadout", State.Loadout:match("^Team (%d+)"))
+	end
+	-- the game only offers matchmaking on _MATCHMAKING levels; the rest stay solo
+	if State.JoinBy[mode] == "Matchmaking" and Data.Levels[levelId]._MATCHMAKING then
+		return Collection:Matchmake(levelId, mode, label, function() return State.Join[mode] end)
 	end
 	local pad = Collection:FreePad(mode == "Raid" and workspace._RAID.Raid or workspace._LOBBIES.Story)
 	if not pad then return nil, mode .. ": no free pad." end
