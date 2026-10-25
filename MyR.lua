@@ -10,7 +10,7 @@ local Env = (getgenv and getgenv()) or _G
 local State = {
 	-- lobby
 	Join = {}, Stage = {}, Difficulty = "Normal", FriendsOnly = false,
-	AutoJoinChallenge = false, Loadout = "Don't change", TeleportDelay = 0,
+	AutoJoinChallenge = false, AutoJoinDailyChallenge = false, Loadout = "Don't change", TeleportDelay = 0,
 	AutoMansion = false, MansionDifficulty = "Normal",
 	-- event
 	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
@@ -207,20 +207,52 @@ local placePositions = Collection:ReadJson(placePositionsPath, {}) -- "map|slot"
 
 --------------------------- [[ Webhook ]] ---------------------------
 
+-- same embed as the Kaitun's
 local httpRequest = request or http_request or (syn and syn.request)
+local WebhookIcon = "https://github.com/DONUT6599/ddgdhdf/blob/main/Asset_1.png?raw=true"
+
+function Collection:Comma(amount)
+	local formatted = tostring(math.floor(tonumber(amount) or 0))
+	while true do
+		local k
+		formatted, k = formatted:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+		if k == 0 then break end
+	end
+	return formatted
+end
+
+-- your avatar headshot for the embed image, looked up once
+function Collection:Avatar()
+	if not Collection.AvatarUrl then
+		pcall(function()
+			local res = httpRequest({ Url = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. LP.UserId .. "&size=420x420&format=Png", Method = "GET" })
+			Collection.AvatarUrl = HttpService:JSONDecode(res.Body).data[1].imageUrl
+		end)
+	end
+	return Collection.AvatarUrl
+end
+
 function Collection:Webhook(kind, title, lines)
 	if not State.WebhookSend[kind] or not State.WebhookUrl:match("^https://") or not httpRequest then return end
-	task.spawn(pcall, httpRequest, {
-		Url = State.WebhookUrl,
-		Method = "POST",
-		Headers = { ["Content-Type"] = "application/json" },
-		Body = HttpService:JSONEncode({ embeds = { {
-			title = title,
-			description = table.concat(lines, "\n"),
-			color = 0x8458F0,
-			footer = { text = MAP_NAME .. " | " .. LP.Name },
-		} } }),
-	})
+	task.spawn(pcall, function()
+		local avatar = Collection:Avatar()
+		httpRequest({
+			Url = State.WebhookUrl,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({
+				username = "VaderHug",
+				embeds = { {
+					title = title,
+					description = "Username : " .. LP.Name .. "\n" .. table.concat(lines, "\n"),
+					footer = { text = "VaderHug", icon_url = WebhookIcon },
+					timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+					image = avatar and { url = avatar } or nil,
+					thumbnail = { url = WebhookIcon },
+				} },
+			}),
+		})
+	end)
 end
 
 --------------------------- [[ Macro Recorder ]] ---------------------------
@@ -650,6 +682,11 @@ for _, mode in MODES do
 end
 
 local ChallengeSection = Tabs.Main:AddSection("Challenge")
+ChallengeSection:AddToggle("AutoJoinDailyChallenge", {
+	Title = "Auto Join Daily Challenge", Default = false,
+	Description = "Joins the daily challenge once per reset, before everything else.",
+	Callback = function(value) State.AutoJoinDailyChallenge = value end,
+})
 ChallengeSection:AddToggle("AutoJoinChallenge", {
 	Title = "Auto Join Challenge", Default = false,
 	Description = "Joins the challenge first if not cleared.",
@@ -923,7 +960,7 @@ local PlaceSection = Tabs.AutoPlay:AddSection("Auto Place")
 local PlaceStatus = PlaceSection:AddParagraph({ Title = "Status", Content = IS_LOBBY and "In the lobby." or "Waiting..." })
 PlaceSection:AddToggle("AutoPlace", {
 	Title = "Auto Place", Default = false,
-	Description = "Places each slot at its point. Pauses for Play Macro.",
+	Description = "Places each slot at its point. Stops at 20 units in events.",
 	Callback = function(value) State.AutoPlace = value end,
 })
 PlaceSection:AddToggle("FarmsFirst", {
@@ -1585,6 +1622,115 @@ StatSection:AddToggle("AutoStatReroll", {
 	end,
 })
 
+local RollbackSection = Tabs.Traits:AddSection("RollBack Reroll")
+-- a joke button: a skeleton runs across the screen (0:00-0:01.656 of the clip, green screen cut out). 30fps frames
+-- cropped to the skeleton and packed in 3 sprite sheets, cached in the profile folder after the first download
+local ROLLBACK_URL = "https://raw.githubusercontent.com/DONUT6599/Kneeguardseller/refs/heads/main/"
+-- per frame: sheet, rect in the sheet (x, y, w, h), and where it sits in the 16:9 frame (x, y, w, h as 0-1), or false
+-- while the skeleton is off screen
+local ROLLBACK_FRAMES = {
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	{ 3, 1000, 0, 4, 10, 0.9961, 0.6806, 0.0039, 0.0181 },
+	{ 3, 703, 0, 22, 154, 0.9766, 0.5222, 0.0234, 0.2861 },
+	{ 3, 659, 0, 44, 248, 0.9547, 0.3556, 0.0453, 0.4597 },
+	{ 3, 583, 0, 76, 249, 0.9211, 0.3486, 0.0789, 0.4611 },
+	{ 3, 473, 0, 110, 265, 0.8859, 0.3389, 0.1141, 0.4903 },
+	{ 3, 328, 0, 145, 277, 0.8492, 0.3319, 0.1508, 0.5125 },
+	{ 3, 0, 0, 161, 284, 0.8242, 0.3264, 0.1680, 0.5250 },
+	{ 2, 857, 684, 151, 292, 0.8055, 0.3208, 0.1570, 0.5417 },
+	{ 2, 514, 684, 130, 298, 0.7852, 0.3181, 0.1359, 0.5514 },
+	{ 2, 644, 684, 102, 297, 0.7664, 0.3208, 0.1062, 0.5500 },
+	{ 2, 746, 684, 111, 295, 0.7320, 0.3222, 0.1156, 0.5458 },
+	{ 2, 378, 684, 136, 301, 0.6867, 0.3139, 0.1414, 0.5569 },
+	{ 2, 201, 684, 177, 308, 0.6367, 0.3028, 0.1844, 0.5708 },
+	{ 2, 0, 684, 201, 317, 0.5914, 0.2958, 0.2094, 0.5875 },
+	{ 2, 650, 350, 227, 327, 0.5367, 0.2917, 0.2367, 0.6056 },
+	{ 2, 0, 350, 254, 334, 0.4734, 0.2889, 0.2648, 0.6181 },
+	{ 2, 254, 350, 216, 334, 0.4570, 0.2917, 0.2250, 0.6181 },
+	{ 2, 470, 350, 180, 334, 0.4414, 0.2958, 0.1875, 0.6194 },
+	{ 2, 639, 0, 184, 335, 0.4164, 0.2986, 0.1922, 0.6208 },
+	{ 2, 219, 0, 220, 338, 0.3633, 0.3028, 0.2289, 0.6264 },
+	{ 2, 439, 0, 200, 338, 0.3117, 0.3056, 0.2078, 0.6264 },
+	{ 2, 0, 0, 219, 350, 0.2508, 0.2931, 0.2281, 0.6486 },
+	{ 1, 614, 403, 289, 364, 0.1891, 0.2819, 0.3008, 0.6736 },
+	{ 1, 310, 403, 304, 381, 0.1242, 0.2708, 0.3172, 0.7056 },
+	{ 1, 0, 403, 310, 394, 0.0789, 0.2625, 0.3234, 0.7306 },
+	{ 1, 0, 0, 296, 403, 0.0352, 0.2542, 0.3086, 0.7458 },
+	{ 1, 296, 0, 241, 403, 0.0266, 0.2542, 0.2508, 0.7458 },
+	{ 1, 537, 0, 217, 402, 0.0000, 0.2556, 0.2258, 0.7444 },
+	{ 3, 161, 0, 167, 278, 0.0000, 0.4847, 0.1742, 0.5153 },
+	{ 3, 725, 0, 124, 60, 0.0000, 0.8889, 0.1289, 0.1111 },
+	{ 3, 849, 0, 101, 53, 0.0000, 0.9014, 0.1055, 0.0986 },
+	{ 3, 950, 0, 50, 33, 0.0000, 0.9389, 0.0523, 0.0611 },
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+	false,
+}
+function Collection:PlayRollback()
+	if type(getcustomasset) ~= "function" then return Collection:Notify("Your executor can't show it.") end
+	local folder = profileFolder .. "/rollback"
+	if canPersist and not isfolder(folder) then makefolder(folder) end
+	local sheets = {}
+	for n = 1, 3 do
+		local path = folder .. "/skeleton" .. n .. ".png"
+		if not isfile(path) then
+			local ok, body = pcall(game.HttpGet, game, ROLLBACK_URL .. "skeleton" .. n .. ".png")
+			if not ok or #body < 1000 then return Collection:Notify("Couldn't download it.") end
+			writefile(path, body)
+		end
+		local ok, id = pcall(getcustomasset, path)
+		if not ok then return Collection:Notify("Couldn't load it.") end
+		sheets[n] = id
+	end
+	Collection:Elevate()
+	local gui = Collection:Instance("ScreenGui", {
+		Name = "VaderRollback", IgnoreGuiInset = true, ResetOnSpawn = false, DisplayOrder = 100,
+		Parent = gethui and gethui() or game:GetService("CoreGui"),
+	})
+	local stage = Collection:Instance("Frame", {
+		Size = UDim2.fromScale(1, 1), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Parent = gui,
+	})
+	Collection:Instance("UIAspectRatioConstraint", { AspectRatio = 16 / 9, Parent = stage })
+	local img = Collection:Instance("ImageLabel", { BackgroundTransparency = 1, Visible = false, Parent = stage })
+	-- load every sheet before the first frame, so none flashes in empty
+	local preload = {}
+	for _, id in sheets do table.insert(preload, Collection:Instance("ImageLabel", { Image = id, Size = UDim2.fromOffset(1, 1), ImageTransparency = 1, BackgroundTransparency = 1, Parent = gui })) end
+	pcall(Services.ContentProvider.PreloadAsync, Services.ContentProvider, preload)
+	Collection:Elevate()
+	local t0 = os.clock()
+	while true do
+		local i = math.floor((os.clock() - t0) * 30) + 1
+		if i > #ROLLBACK_FRAMES then break end
+		local f = ROLLBACK_FRAMES[i]
+		img.Visible = f ~= false
+		if f then
+			img.Image = sheets[f[1]]
+			img.ImageRectOffset, img.ImageRectSize = Vector2.new(f[2], f[3]), Vector2.new(f[4], f[5])
+			img.Position, img.Size = UDim2.fromScale(f[6], f[7]), UDim2.fromScale(f[8], f[9])
+		end
+		Services.RunService.RenderStepped:Wait()
+	end
+	gui:Destroy()
+end
+RollbackSection:AddButton({
+	Title = "RollBack Reroll",
+	Callback = function() task.spawn(Collection.PlayRollback, Collection) end,
+})
+
 Tabs.Traits:AddButton({
 	Title = "Refresh Unit Lists",
 	Callback = function() Collection:RefreshUnitDropdowns() end,
@@ -1699,7 +1845,7 @@ WebhookSection:AddButton({
 		if not State.WebhookUrl:match("^https://") then return Collection:Notify("Paste a webhook URL first.") end
 		local send = State.WebhookSend
 		State.WebhookSend = { Test = true }
-		Collection:Webhook("Test", "Webhook connected", { "Gems: " .. Collection:Gems() })
+		Collection:Webhook("Test", "Webhook connected", { "Total Gem : " .. Collection:Comma(Collection:Gems()) })
 		State.WebhookSend = send
 		Collection:Notify("Test sent.")
 	end,
@@ -1759,22 +1905,26 @@ function Collection:FreePad(folder)
 	end
 end
 
-function Collection:JoinChallenge()
-	local c = Collection:RefreshChallenge()
-	if type(c) ~= "table" or c.current_uuid == session.profile_data.last_completed_challenge_uuid then return nil end
-	local folder = workspace:FindFirstChild("_CHALLENGES") and workspace._CHALLENGES:FindFirstChild("Challenges")
+-- daily = the once-a-day challenge on _CHALLENGES.DailyChallenge, else the half-hourly one
+function Collection:JoinChallenge(daily)
+	local c = daily and Collection:Invoke("get_daily_challenge") or Collection:RefreshChallenge()
+	local done = session.profile_data[daily and "last_completed_daily_challenge_uuid" or "last_completed_challenge_uuid"]
+	if type(c) ~= "table" or c.current_uuid == done then return nil end
+	local name, toggle = daily and "daily challenge" or "challenge", daily and "AutoJoinDailyChallenge" or "AutoJoinChallenge"
+	local level = daily and type(c.current_level) == "table" and c.current_level.name or c.current_level_id
+	local folder = workspace:FindFirstChild("_CHALLENGES") and workspace._CHALLENGES:FindFirstChild(daily and "DailyChallenge" or "Challenges")
 	for _, pad in folder and folder:GetChildren() or {} do
 		local tele, players = pad:FindFirstChild("Teleporting"), pad:FindFirstChild("Players")
 		if tele and not tele.Value and (not players or #players:GetChildren() == 0) and Collection:Invoke("request_join_lobby", pad.Name) then
-			if not Collection:TeleportDelay("Starting the challenge", function() return State.AutoJoinChallenge end) then
+			if not Collection:TeleportDelay("Starting the " .. name, function() return State[toggle] end) then
 				Collection:Invoke("request_leave_lobby", pad.Name)
-				return nil, "Challenge: start cancelled."
+				return nil, name .. ": start cancelled."
 			end
 			Collection:Invoke("request_start_game", pad.Name)
-			return pad, "Joined challenge: " .. tostring(c.current_challenge) .. " on " .. tostring(c.current_level_id)
+			return pad, "Joined " .. name .. ": " .. tostring(c.current_challenge) .. " on " .. tostring(level)
 		end
 	end
-	return nil, "No free challenge pad"
+	return nil, "No free " .. name .. " pad"
 end
 
 -- the event stage on the lobby's event pads: walk in like Play Solo, or queue like the Matchmaking button
@@ -1942,12 +2092,13 @@ if IS_LOBBY then
 		task.wait(5)
 		while not closed do
 			-- an auto dungeon run (or one about to start) has the lobby to itself
-			if (State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
+			if (State.AutoJoinDailyChallenge or State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
 				and not (State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)) then
 				local pad, msg
 				local notes = {}
 				for _, try in {
-					{ State.AutoJoinChallenge, Collection.JoinChallenge },
+					{ State.AutoJoinDailyChallenge, function() return Collection:JoinChallenge(true) end },
+					{ State.AutoJoinChallenge, function() return Collection:JoinChallenge() end },
 					{ State.AutoContract, Collection.JoinContract },
 					{ State.AutoJoinEvent, Collection.JoinEvent },
 					{ State.AutoMansion, Collection.JoinMansion },
@@ -2054,6 +2205,7 @@ end
 --------------------------- [[ Auto Play ]] ---------------------------
 
 local placePending = false -- Auto Place still has units to put down; Place Before Upgrading holds upgrades meanwhile
+local EVENT_MAX_UNITS = 20 -- in events Auto Place stops at this many of your units on the map
 local macroPending = false -- Play Macro still has steps left; Auto Upgrade waits so the macro gets the money
 
 -- a slot's point: a spot along the first enemy lane at Placement Distance (Farm Placement Distance for money units),
@@ -2403,9 +2555,10 @@ if not IS_LOBBY then task.spawn(function()
 		task.wait(1)
 		Collection:Elevate()
 		local ok, problem = pcall(function()
-			local placed = {}
+			local placed, total = {}, 0
 			for _, m in Collection:MyUnits() do
 				placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1
+				total += 1
 			end
 			local equipped = Collection:Equipped()
 			local pick, lines, slots = nil, {}, {}
@@ -2445,12 +2598,17 @@ if not IS_LOBBY then task.spawn(function()
 				end
 			end
 
+			-- events: stop placing once EVENT_MAX_UNITS are on the map; upgrades and abilities carry on
+			local eventFull = Collection:CurrentMode() == "Event" and total >= EVENT_MAX_UNITS
+			if eventFull then pick = nil end
 			placePending = State.AutoPlace and not State.PlayMacro and pick ~= nil
 			local note
 			if not State.AutoPlace then
 				note = "Auto Place is off."
 			elseif State.PlayMacro then
 				note = "Paused while Play Macro is on."
+			elseif eventFull then
+				note = string.format("Event: %d units placed - stopped.", total)
 			elseif not pick then
 				note = "Every slot that's on is placed."
 			else
@@ -2598,10 +2756,17 @@ if not IS_LOBBY then task.spawn(function()
 	Collection:Track(fromServer.game_finished.OnClientEvent:Connect(function(results)
 		dungeonMatchOver = true
 		results = type(results) == "table" and results or {}
-		Collection:Webhook("Match results", (results.victory and "Victory" or "Defeat") .. " - " .. tostring(Loader.LevelData.name or Loader.LevelData.id), {
-			"Wave: " .. tostring(workspace._wave_num.Value),
-			"Gems: " .. tostring(results.gem_reward or 0) .. "  Gold: " .. tostring(results.gold_reward or 0) .. "  XP: " .. tostring(results.xp_reward or 0),
-			"Total gems: " .. Collection:Gems(),
+		local stats = type(results.stats) == "table" and results.stats or {}
+		local secs = math.ceil(tonumber(stats.time_taken) or 0)
+		Collection:Webhook("Match results", (results.victory and "Victory" or "Defeat") .. " !", {
+			"Total Gem : " .. Collection:Comma(Collection:Gems()),
+			"Total XP : " .. Collection:Comma(LP._stats.player_xp.Value),
+			"",
+			"Map : " .. tostring(results.title or Loader.LevelData.name or Loader.LevelData.id),
+			"Wave : " .. tostring(stats.waves_completed or workspace._wave_num.Value),
+			"Total Time : " .. string.format("%02d:%02d", secs // 60, secs % 60),
+			"Gem Earn : " .. Collection:Comma(results.gem_reward),
+			"XP Earn : " .. Collection:Comma(results.xp_reward),
 		})
 		task.delay(3, function()
 			if closed then return end
