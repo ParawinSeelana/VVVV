@@ -15,19 +15,19 @@ local State = {
 	AutoPortal = false, Portals = {},
 	-- event
 	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
-	AutoDiscard = false, DiscardSpells = {}, AutoSpells = false, UseSpells = {}, AutoKeepUnits = false, KeepMode = "Keep", KeepUnits = {},
+	AutoDiscard = false, DiscardSpells = {}, AutoSpells = false, UseSpells = {}, AutoKeepUnits = false, KeepMode = "Keep", KeepUnits = {}, UpgradeOnlyKept = false,
 	AutoContract = false, ContractJoinBy = "Normal", ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
 	AutoEventShop = false, EventShopItems = {},
 	-- dungeon
-	AutoDungeon = false, DungeonStart = false, DungeonChests = "Save for the end", DungeonShrine = "Accept if no curse",
+	AutoDungeon = false, DungeonStart = false, DungeonStopLastLife = false, DungeonChests = "Save for the end", DungeonShrine = "Accept if no curse",
 	DungeonPickBy = "Rewards, then weakness", DungeonLookahead = true,
 	DungeonRoomOrder = {}, DungeonWeakOrder = {}, DungeonShopOrder = {},
 	-- macro
 	MacroName = nil, AutoSwitchMacro = false, MacroSlotSpots = false,
 	-- match
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
-	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {}, UpgradeOrder = "Cheapest first",
+	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradePriority = {}, UpgradeOrder = "Cheapest first",
 	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
@@ -409,6 +409,10 @@ function VaderUI:Destroy()
 	closed = true
 	State.HideName = false
 	pcall(Collection.ApplyHideName, Collection)
+	State.DeleteEnemies = false
+	pcall(Collection.ShowEnemies, Collection)
+	State.DeleteMap = false
+	pcall(Collection.ApplyDeleteMap, Collection)
 	State.Join, State.AutoSummon, State.PlayMacro, State.AutoUpgrade = {}, false, false, false
 	if Client.EndpointsClient.invoke_server == Collection.RecordingInvoke then Client.EndpointsClient.invoke_server = originalInvoke end
 	for _, connection in ipairs(Connections) do
@@ -871,6 +875,11 @@ do
 		Description = "Nothing picked = nothing discarded.",
 		Callback = function(value) State.KeepUnits = value end,
 	})
+	KeepSection:AddToggle("UpgradeOnlyKept", {
+		Title = "Upgrade Only Kept", Default = false,
+		Description = "Auto Upgrade skips units the list doesn't keep.",
+		Callback = function(value) State.UpgradeOnlyKept = value end,
+	})
 end
 
 -- events that hand out random units also hand out spells, each with an X that swaps it for something new
@@ -1000,6 +1009,11 @@ DungeonSection:AddToggle("DungeonStart", {
 	Title = "Auto Start Run", Default = false,
 	Description = "Starts a run with a key.",
 	Callback = function(value) State.DungeonStart = value end,
+})
+DungeonSection:AddToggle("DungeonStopLastLife", {
+	Title = "Stop At Last Life", Default = false,
+	Description = "1 heart left on a room: stops, so you retry it yourself.",
+	Callback = function(value) State.DungeonStopLastLife = value end,
 })
 DungeonSection:AddDropdown("DungeonChests", {
 	Title = "Open Chests", Values = { "Save for the end", "At every checkpoint" }, Default = "Save for the end", Multi = false,
@@ -1156,8 +1170,8 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 		Callback = function(value) cfg.Mode = value end,
 	})
 	section:AddSlider("Slot" .. slot .. "Max", {
-		Title = "Max Placed", Default = 6, Min = 1, Max = 6, Rounding = 0,
-		Description = cap and ("Max " .. cap .. ".") or nil,
+		Title = "Max Placed", Default = 6, Min = 1, Max = 20, Rounding = 0,
+		Description = cap and ("Max " .. cap .. ", none in Fool's Hunt.") or nil,
 		Callback = function(value) cfg.Max = value end,
 	})
 	section:AddButton({
@@ -1173,13 +1187,18 @@ UpgradeSection:AddToggle("AutoUpgrade", {
 	Description = "Waits for the macro to finish.",
 	Callback = function(value) State.AutoUpgrade = value end,
 })
-UpgradeSection:AddDropdown("UpgradeFirst", {
-	Title = "Upgrade First", Values = equippedNames, Multi = true, Default = {},
-	Callback = function(value) State.UpgradeFirst = value end,
-})
+do
+	local entries = {}
+	for _, name in equippedNames do table.insert(entries, { id = name, label = name, on = false }) end
+	Collection:AddPriorityList(UpgradeSection, "UpgradePriority", {
+		Title = "Upgrade Priority", Entries = entries,
+		Description = "Ticked = maxed top first. Your team at hub load.",
+		Callback = function(value) State.UpgradePriority = value end,
+	})
+end
 UpgradeSection:AddDropdown("UpgradeOrder", {
 	Title = "Upgrade Order", Values = { "Cheapest first", "Farms first", "Strongest first" }, Default = "Cheapest first", Multi = false,
-	Description = "For units not in Upgrade First.",
+	Description = "For units not ticked in Upgrade Priority.",
 	Callback = function(value) State.UpgradeOrder = value end,
 })
 UpgradeSection:AddToggle("PlaceBeforeUpgrading", {
@@ -1931,6 +1950,65 @@ Performance:AddToggle("LowGraphics", {
 			local setting = LP._settings:FindFirstChild(name)
 			if setting and setting.Value ~= value then Collection:Invoke("toggle_setting", name, value) end
 		end
+	end,
+})
+
+-- enemies (pve_units) leave your client: nothing to render or animate, while the server still runs and kills them.
+-- Parent = nil, not Destroy: the game's death handler still moves the model to _DEAD_UNITS, and Destroy locks Parent
+Collection.HiddenEnemies = setmetatable({}, { __mode = "k" })
+function Collection:HideEnemy(m)
+	if State.DeleteEnemies and CollectionService:HasTag(m, "pve_units") then
+		Collection.HiddenEnemies[m] = true
+		m.Parent = nil
+	end
+end
+-- the living ones come back; dead ones were destroyed or moved to _DEAD_UNITS
+function Collection:ShowEnemies()
+	for m in Collection.HiddenEnemies do
+		if m.Parent == nil then pcall(function() m.Parent = workspace._UNITS end) end
+	end
+	table.clear(Collection.HiddenEnemies)
+end
+Performance:AddToggle("DeleteEnemies", {
+	Title = "Delete Enemies (more FPS)", Default = false,
+	Description = "Your screen only. The server still has them, so your units keep killing them.",
+	Callback = function(value)
+		State.DeleteEnemies = value
+		if IS_LOBBY then return end
+		if value then
+			for _, m in workspace._UNITS:GetChildren() do Collection:HideEnemy(m) end
+		else
+			Collection:ShowEnemies()
+		end
+	end,
+})
+-- deferred so the game's own spawn handler sets the enemy up first
+if not IS_LOBBY then
+	Collection:Track(workspace._UNITS.ChildAdded:Connect(function(m) task.defer(Collection.HideEnemy, Collection, m) end))
+end
+
+-- the map's scenery (workspace._map, most of a map's parts) leaves your client; Auto Place only needs _terrain, _road and
+-- _BASES, which stay. Parent = nil, not Destroy: the map's own scripts move parts they grabbed at load every frame
+function Collection:ApplyDeleteMap()
+	if IS_LOBBY then return end
+	if State.DeleteMap then
+		local map = workspace:FindFirstChild("_map")
+		if map then Collection.HiddenMap, map.Parent = map, nil end
+	elseif Collection.HiddenMap then
+		Collection.HiddenMap.Parent = workspace
+		Collection.HiddenMap = nil
+	end
+end
+Performance:AddToggle("DeleteMap", {
+	Title = "Delete Map (more FPS)", Default = false,
+	Description = "Your screen only. Hides the scenery; the ground and road stay, so Auto Place still works.",
+	Callback = function(value)
+		State.DeleteMap = value
+		-- wait for the map, so its own scripts have grabbed their parts first
+		task.spawn(function()
+			repeat task.wait(1) until closed or IS_LOBBY or workspace._MAP_CONFIG.MapLoaded.Value
+			Collection:ApplyDeleteMap()
+		end)
 	end,
 })
 
@@ -2749,7 +2827,9 @@ if not IS_LOBBY then task.spawn(function()
 				end
 
 				if data and cfg.On then
-					local count, cap = placed[uuid] or 0, math.min(cfg.Max, data.spawn_cap or cfg.Max)
+					-- Fool's Hunt has no per-unit cap (a unique places as often as any), only the 20-unit event limit
+					local unitCap = (Loader.LevelData or {}).id ~= "april2_event" and data.spawn_cap or nil
+					local count, cap = placed[uuid] or 0, math.min(cfg.Max, unitCap or cfg.Max)
 					local farm = Collection:IsFarm(u.unit_id)
 					table.insert(lines, string.format("%s %s%s: %d/%d%s", slot, Collection:UnitName(u), Collection:PlacementTag(data), count, cap,
 						anchor and (" at " .. where) or (" - " .. where)))
@@ -2906,12 +2986,15 @@ function Collection:SpellTarget(id)
 	return best
 end
 
+-- a unit the Keep list keeps: Keep mode the picked ones, Discard mode the rest; nothing picked keeps every unit
+function Collection:Kept(u)
+	return not next(State.KeepUnits) or (State.KeepUnits[Collection:UnitName(u)] == true) == (State.KeepMode == "Keep")
+end
+
 -- Auto Keep / Discard Units: a unit the event handed out that the list says to discard (Astral Summon's are always kept)
 function Collection:Unwanted(uuid)
-	local u = State.AutoKeepUnits and next(State.KeepUnits) and not Collection.Summoned[uuid] and (session.collection.temporary_units or {})[uuid]
-	if not u then return false end
-	local picked = State.KeepUnits[Collection:UnitName(u)] == true
-	return picked == (State.KeepMode == "Discard")
+	local u = State.AutoKeepUnits and not Collection.Summoned[uuid] and (session.collection.temporary_units or {})[uuid]
+	return u and not Collection:Kept(u) or false
 end
 
 -- random-unit events: X the unwanted units and picked spells as they're handed out, cast the auto-use spells
@@ -3207,16 +3290,21 @@ if not IS_LOBBY then task.spawn(function()
 		while not closed do
 			task.wait(1)
 			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
-				local best, bestPicked
+				-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order
+				local rank, best = {}, nil
+				for i, entry in State.UpgradePriority do
+					if entry.on then rank[entry.id] = i end
+				end
 				for _, m in Collection:MyUnits() do
 					local cost = Collection:UpgradeCost(m)
-					if cost then
-						local u = Collection:Unit(m._stats.uuid.Value) or {}
-						local picked = u.unit_id and State.UpgradeFirst[Collection:UnitName(u)] == true
+					local u = Collection:Unit(m._stats.uuid.Value) or {}
+					-- Upgrade Only Kept: units the Keep list wouldn't keep stay as they are
+					if cost and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
+						local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
 						local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
 							or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
-						if not best or (picked and not bestPicked) or (picked == bestPicked and score > best.score) then
-							best, bestPicked = { model = m, cost = cost, score = score }, picked
+						if not best or r < best.rank or (r == best.rank and score > best.score) then
+							best = { model = m, cost = cost, score = score, rank = r }
 						end
 					end
 				end
@@ -3429,7 +3517,10 @@ task.spawn(function()
 				act(accept and "dungeon_shrine_accept" or "dungeon_continue_shop")
 			elseif dd._started and (IS_LOBBY or dungeonMatchOver) and os.clock() - lastEnter > 20 then
 				local choice, room = Collection:PickRoom(dd)
-				if choice and Collection:TeleportDelay("Entering room " .. choice, function() return State.AutoDungeon end) then
+				-- a lost room stays picked and costs a heart per retry; at 0 the run is gone
+				if State.DungeonStopLastLife and dd.selected_next and (dd.selected_next.lives or 5) <= 1 then
+					note = "Room " .. tostring(choice) .. ": 1 heart left - stopped, retry it yourself"
+				elseif choice and Collection:TeleportDelay("Entering room " .. choice, function() return State.AutoDungeon end) then
 					lastEnter = os.clock()
 					note = "Entering room " .. choice .. ": " .. Collection:DescribeRoom(room)
 					act("dungeon_enter_room", choice)
