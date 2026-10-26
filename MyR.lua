@@ -9,12 +9,13 @@ local Env = (getgenv and getgenv()) or _G
 
 local State = {
 	-- lobby
-	Join = {}, Stage = {}, JoinBy = {}, Difficulty = "Normal", FriendsOnly = false,
-	AutoJoinChallenge = false, AutoJoinDailyChallenge = false, DailyJoinBy = "Normal", Loadout = "Don't change", TeleportDelay = 0,
+	Join = {}, JoinPriority = {}, Stage = {}, JoinBy = {}, Difficulty = "Normal", FriendsOnly = false,
+	AutoJoinChallenge = false, AutoJoinDailyChallenge = false, DailyJoinBy = "Normal", ChallengeJoinBy = "Normal", Loadout = "Don't change", TeleportDelay = 0,
 	AutoMansion = false, MansionDifficulty = "Normal",
+	AutoPortal = false, Portals = {},
 	-- event
 	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
-	AutoDiscard = false, DiscardSpells = {},
+	AutoDiscard = false, DiscardSpells = {}, AutoSpells = false, UseSpells = {}, AutoKeepUnits = false, KeepMode = "Keep", KeepUnits = {},
 	AutoContract = false, ContractJoinBy = "Normal", ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
 	AutoEventShop = false, EventShopItems = {},
@@ -27,7 +28,7 @@ local State = {
 	-- match
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeFirst = {}, UpgradeOrder = "Cheapest first",
-	AutoAbility = false, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
+	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
 	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true, FarmsFirst = false, ShowSpots = false,
@@ -154,6 +155,22 @@ function Collection:UnitName(u) return (Data.Units[u.unit_id] and Data.Units[u.u
 function Collection:Gems() return LP._stats.gem_amount.Value end
 function Collection:Money() return LP._stats.resource.Value end
 function Collection:InPad() return LP:FindFirstChild("AlreadyInLobby") and LP.AlreadyInLobby.Value end
+-- the summon reveal waits for a real click (UserInputService.InputBegan) on every unit, and the game's auto-sell only
+-- runs after the last one: click through until no reveal has been up for 2s. VirtualUser clicks don't reach InputBegan
+function Collection:SkipSummonReveal()
+	local idle = 0
+	while idle < 2 and not closed do
+		if Client.GUIService.summon_ui.hatching then
+			idle = 0
+			local v = workspace.CurrentCamera.ViewportSize
+			Services.VirtualInputManager:SendMouseButtonEvent(v.X / 2, v.Y / 2, 0, true, game, 0)
+			Services.VirtualInputManager:SendMouseButtonEvent(v.X / 2, v.Y / 2, 0, false, game, 0)
+		else
+			idle += 0.25
+		end
+		task.wait(0.25)
+	end
+end
 function Collection:DungeonData() return session.profile_data.dungeon_data or {} end
 
 function Collection:DescribeTraits(traits)
@@ -353,8 +370,14 @@ function Collection:MacroSummary(steps)
 	return string.format("%d steps: %d spawn, %d upgrade, %d sell, %d ability", #steps, counts.spawn, counts.upgrade, counts.sell, counts.ability)
 end
 
+-- Astral Summon puts a unit into the slot it was cast from; Auto Keep / Discard Units never discards that one
+Collection.SummonCast = {} -- slot -> when Astral Summon was cast from it
+Collection.Summoned = {} -- uuid -> true for units Astral Summon put on the bar
+
 -- a plain function (no self): it stands in for the game's EndpointsClient.invoke_server
 function Collection.RecordingInvoke(name, ...)
+	local slot = (...)
+	if name == "use_ingame_spell" and (session.ingame_spells or {})[slot] == "summon" then Collection.SummonCast[tostring(slot)] = os.clock() end
 	local action = State.RecordMacro and recording and Collection:MapKey() and MACRO_ACTIONS[name]
 	local step
 	if action == "spawn" then
@@ -400,7 +423,6 @@ end
 
 -- stages per game mode: label -> level id
 local MODES = { "Story", "Infinite", "Legend", "Raid" }
-local JOIN_ORDER = { "Raid", "Legend", "Story", "Infinite" }
 local stages = {}
 for _, mode in MODES do stages[mode] = { labels = {}, ids = {} } end
 function Collection:AddStage(mode, label, levelId)
@@ -657,6 +679,25 @@ JoinSection:AddSlider("TeleportDelay", {
 	Description = "Wait before any teleport.",
 	Callback = function(value) State.TeleportDelay = value end,
 })
+-- ids are the keys of the join loop's tries
+Collection:AddPriorityList(JoinSection, "JoinPriority", {
+	Title = "Join Priority",
+	Description = "Top first. Unticked = skipped.",
+	Rows = 10,
+	Entries = {
+		{ id = "DailyChallenge", label = "Daily Challenge" },
+		{ id = "Challenge", label = "Challenge" },
+		{ id = "Contract", label = "Contract" },
+		{ id = "Portal", label = "Portal" },
+		{ id = "Event", label = "Event Stage" },
+		{ id = "Mansion", label = "Infinity Mansion" },
+		{ id = "Raid", label = "Raid" },
+		{ id = "Legend", label = "Legend" },
+		{ id = "Story", label = "Story" },
+		{ id = "Infinite", label = "Infinite" },
+	},
+	Callback = function(value) State.JoinPriority = value end,
+})
 
 local MODE_INFO = {
 	Story = "Story acts.",
@@ -690,7 +731,7 @@ end
 local ChallengeSection = Tabs.Main:AddSection("Challenge")
 ChallengeSection:AddToggle("AutoJoinDailyChallenge", {
 	Title = "Auto Join Daily Challenge", Default = false,
-	Description = "Joins the daily challenge once per reset, before everything else.",
+	Description = "Joins the daily challenge once per reset.",
 	Callback = function(value) State.AutoJoinDailyChallenge = value end,
 })
 ChallengeSection:AddDropdown("DailyJoinBy", {
@@ -700,8 +741,13 @@ ChallengeSection:AddDropdown("DailyJoinBy", {
 })
 ChallengeSection:AddToggle("AutoJoinChallenge", {
 	Title = "Auto Join Challenge", Default = false,
-	Description = "Joins the challenge first if not cleared.",
+	Description = "Joins the challenge if not cleared.",
 	Callback = function(value) State.AutoJoinChallenge = value end,
+})
+ChallengeSection:AddDropdown("ChallengeJoinBy", {
+	Title = "Challenge Join By", Values = { "Normal", "Matchmaking" }, Default = "Normal", Multi = false,
+	Description = "Normal = solo. Matchmaking = queue.",
+	Callback = function(value) State.ChallengeJoinBy = value end,
 })
 ChallengeSection:AddToggle("LeaveOnChallenge", {
 	Title = "Leave When Challenge Changes", Default = false,
@@ -720,6 +766,28 @@ MansionSection:AddDropdown("MansionDifficulty", {
 	Description = "Hard needs room 100 last season.",
 	Callback = function(value) State.MansionDifficulty = value end,
 })
+
+do
+	-- every portal item in the game by name; some share one (the four Devil Portals)
+	local portalNames = {}
+	for _, item in Data.Items do
+		if type(item) == "table" and item.usage and item.usage.type == "open_portal" and not table.find(portalNames, item.name) then
+			table.insert(portalNames, item.name)
+		end
+	end
+	table.sort(portalNames)
+	local PortalSection = Tabs.Main:AddSection("Portal")
+	PortalSection:AddToggle("AutoPortal", {
+		Title = "Auto Join Portal", Default = false,
+		Description = "Opens a picked portal from your inventory.",
+		Callback = function(value) State.AutoPortal = value end,
+	})
+	PortalSection:AddDropdown("Portals", {
+		Title = "Portals", Values = portalNames, Multi = true, Default = {},
+		Description = "April Fools = Demon Academy Portal.",
+		Callback = function(value) State.Portals = value end,
+	})
+end
 
 --------------------------- [[ Event Tab ]] ---------------------------
 
@@ -780,6 +848,31 @@ Collection:AddPriorityList(CardSection, "CardPriority", {
 	Callback = function(value) State.CardPriority = value end,
 })
 
+-- events that hand out random units (April Fools' Fool's Hunt): the pool is server-side, so every unit is offered
+do
+	local unitNames = {}
+	for _, unit in Data.Units do
+		if type(unit) == "table" and unit.rarity and unit.name and not table.find(unitNames, unit.name) then table.insert(unitNames, unit.name) end
+	end
+	table.sort(unitNames)
+	local KeepSection = Tabs.Event:AddSection("Event Units")
+	KeepSection:AddToggle("AutoKeepUnits", {
+		Title = "Auto Keep / Discard Units", Default = false,
+		Description = "Filters handed-out units. Astral Summon's are always kept.",
+		Callback = function(value) State.AutoKeepUnits = value end,
+	})
+	KeepSection:AddDropdown("KeepMode", {
+		Title = "Mode", Values = { "Keep", "Discard" }, Default = "Keep", Multi = false,
+		Description = "Keep = discard everything not picked. Discard = discard the picked ones.",
+		Callback = function(value) State.KeepMode = value end,
+	})
+	KeepSection:AddDropdown("KeepUnits", {
+		Title = "Units", Values = unitNames, Multi = true, Default = {},
+		Description = "Nothing picked = nothing discarded.",
+		Callback = function(value) State.KeepUnits = value end,
+	})
+end
+
 -- events that hand out random units also hand out spells, each with an X that swaps it for something new
 local spellNames = {}
 for _, spell in Data.IngameSpells or {} do table.insert(spellNames, spell.name) end
@@ -795,6 +888,26 @@ SpellSection:AddDropdown("DiscardSpells", {
 	Description = "Unpicked spells are kept.",
 	Callback = function(value) State.DiscardSpells = value end,
 })
+SpellSection:AddToggle("AutoSpells", {
+	Title = "Auto Use Spells", Default = false,
+	Description = "Casts picked spells when their rule finds a target.",
+	Callback = function(value) State.AutoSpells = value end,
+})
+do
+	-- Refund has no safe automatic rule, so it isn't offered
+	local useSpellNames = {}
+	for _, name in spellNames do if name ~= "Refund" then table.insert(useSpellNames, name) end end
+	SpellSection:AddDropdown("UseSpells", {
+		Title = "Use Spells", Values = useSpellNames, Multi = true, Default = {},
+		Callback = function(value) State.UseSpells = value end,
+	})
+	SpellSection:AddParagraph({
+		Title = "Spell Rules",
+		Content = "Merge : Fully upgraded unit with a non-upgraded copy of the same unit in its range.\n"
+			.. "Clone / Random Buff / Ritual : Your strongest fully upgraded unit.\n"
+			.. "Astral Gate / Astral Summon : Cast right away.",
+	})
+end
 
 local ContractSection = Tabs.Event:AddSection("Event Contracts")
 ContractSection:AddToggle("AutoContract", {
@@ -1081,6 +1194,11 @@ AbilitySection:AddToggle("AutoAbility", {
 	Title = "Auto Use Abilities", Default = false,
 	Description = "Skips buff units.",
 	Callback = function(value) State.AutoAbility = value end,
+})
+AbilitySection:AddDropdown("AbilityIgnore", {
+	Title = "Ignore Units", Values = equippedNames, Multi = true, Default = {},
+	Description = "Fusion units like Carrot, Vegito.",
+	Callback = function(value) State.AbilityIgnore = value end,
 })
 local BuffSection = Tabs.Ability:AddSection("Buffs")
 BuffSection:AddToggle("LoopBuffs", {
@@ -1947,8 +2065,10 @@ function Collection:JoinChallenge(daily)
 	if type(c) ~= "table" or c.current_uuid == done then return nil end
 	local name, toggle = daily and "daily challenge" or "challenge", daily and "AutoJoinDailyChallenge" or "AutoJoinChallenge"
 	local level = daily and type(c.current_level) == "table" and c.current_level.name or c.current_level_id
-	if daily and State.DailyJoinBy == "Matchmaking" then
-		return Collection:Matchmake("__DAILY_CHALLENGE", "Daily challenge", tostring(level), function() return State[toggle] end)
+	-- the game's pads queue these two ids, not the level
+	if State[daily and "DailyJoinBy" or "ChallengeJoinBy"] == "Matchmaking" then
+		return Collection:Matchmake(daily and "__DAILY_CHALLENGE" or "__NORMAL_CHALLENGE", daily and "Daily challenge" or "Challenge",
+			tostring(level), function() return State[toggle] end)
 	end
 	local folder = workspace:FindFirstChild("_CHALLENGES") and workspace._CHALLENGES:FindFirstChild(daily and "DailyChallenge" or "Challenges")
 	for _, pad in folder and folder:GetChildren() or {} do
@@ -2042,19 +2162,37 @@ function Collection:JoinContract()
 	if State.ContractJoinBy == "Matchmaking" then
 		return Collection:Matchmake(contract.id, "Contract", tostring(contract.name), function() return State.AutoContract end)
 	end
+	return Collection:StartPortal("Contract", tostring(contract.name), function() return State.AutoContract end,
+		function() return Collection:Invoke("open_event_contract_portal", key) end)
+end
+
+-- open() opens a portal lobby for you; once the server hands over its pad, start it. wanted() is the feature's toggle
+function Collection:StartPortal(mode, label, wanted, open)
 	local created
 	local conn = fromServer.portal_lobby_owner_created.OnClientEvent:Connect(function(pad) created = pad end)
-	local opened = Collection:Invoke("open_event_contract_portal", key)
+	open()
 	local t0 = os.clock()
-	while opened and not created and os.clock() - t0 < 5 do task.wait(0.1) end
+	while not created and os.clock() - t0 < 5 do task.wait(0.1) end
 	conn:Disconnect()
-	if not created then return nil, "Contract: couldn't open a portal." end
-	if not Collection:TeleportDelay("Starting the contract", function() return State.AutoContract end) then
+	if not created then return nil, mode .. ": couldn't open a portal." end
+	if not Collection:TeleportDelay("Starting " .. label, wanted) then
 		Collection:Invoke("request_leave_lobby", created.Name)
-		return nil, "Contract: start cancelled."
+		return nil, mode .. ": start cancelled."
 	end
 	Collection:Invoke("request_start_game", created.Name)
-	return created, "Contract: starting " .. tostring(contract.name)
+	return created, mode .. ": starting " .. label
+end
+
+-- a picked portal from your inventory, opened like the inventory's Use button
+function Collection:JoinPortal()
+	for _, it in session.inventory.inventory_profile_data.unique_items do
+		local item = Data.Items[it.item_id]
+		if item and item.usage and item.usage.type == "open_portal" and State.Portals[item.name] then
+			return Collection:StartPortal("Portal", item.name, function() return State.AutoPortal end,
+				function() return Collection:Invoke("use_portal", it.uuid, State.FriendsOnly and { friends_only = true } or nil) end)
+		end
+	end
+	return nil, "Portal: none of the picked portals in your inventory."
 end
 
 -- Infinity Mansion: the next room you haven't cleared, like the game's Start button. A started room teleports during the
@@ -2122,28 +2260,26 @@ if IS_LOBBY then
 		task.wait(5)
 		while not closed do
 			-- an auto dungeon run (or one about to start) has the lobby to itself
-			if (State.AutoJoinDailyChallenge or State.AutoJoinChallenge or State.AutoContract or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
+			if (State.AutoJoinDailyChallenge or State.AutoJoinChallenge or State.AutoContract or State.AutoPortal or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
 				and not (State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)) then
 				local pad, msg
 				local notes = {}
-				for _, try in {
-					{ State.AutoJoinDailyChallenge, function() return Collection:JoinChallenge(true) end },
-					{ State.AutoJoinChallenge, function() return Collection:JoinChallenge() end },
-					{ State.AutoContract, Collection.JoinContract },
-					{ State.AutoJoinEvent, Collection.JoinEvent },
-					{ State.AutoMansion, Collection.JoinMansion },
-				} do
+				local tries = {
+					DailyChallenge = { State.AutoJoinDailyChallenge, function() return Collection:JoinChallenge(true) end },
+					Challenge = { State.AutoJoinChallenge, function() return Collection:JoinChallenge() end },
+					Contract = { State.AutoContract, Collection.JoinContract },
+					Portal = { State.AutoPortal, Collection.JoinPortal },
+					Event = { State.AutoJoinEvent, Collection.JoinEvent },
+					Mansion = { State.AutoMansion, Collection.JoinMansion },
+				}
+				for _, mode in MODES do tries[mode] = { State.Join[mode], function() return Collection:JoinStage(mode) end } end
+				-- Join Priority: top first, unticked skipped
+				for _, entry in State.JoinPriority do
 					if pad then break end
-					if try[1] then
+					local try = tries[entry.id]
+					if entry.on and try[1] then
 						pad, msg = try[2](Collection)
 						if msg then table.insert(notes, msg) end
-					end
-				end
-				for _, mode in JOIN_ORDER do
-					if pad then break end
-					if State.Join[mode] then
-						pad, msg = Collection:JoinStage(mode)
-						table.insert(notes, msg)
 					end
 				end
 				if #notes > 0 then
@@ -2198,6 +2334,10 @@ end
 function Collection:UpgradeCost(m)
 	local ok, info, isMax = pcall(Client.GUIService.get_next_upgrade_info, m, Collection:Unit(m._stats.uuid.Value) or {})
 	if ok and info and not isMax then return math.ceil(info.cost * Core.UnitServiceCore.calculate_upgrade_cost_multiplier(m, session)) end
+end
+function Collection:IsMaxed(m)
+	local ok, _, isMax = pcall(Client.GUIService.get_next_upgrade_info, m, Collection:Unit(m._stats.uuid.Value) or {})
+	return ok and isMax == true
 end
 
 -- an event card's kind: its first effect that isn't the event-currency bonus most curses carry
@@ -2595,7 +2735,7 @@ if not IS_LOBBY then task.spawn(function()
 			for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 				local cfg = State.Slots[slot]
 				local uuid = equipped[slot] or equipped[tonumber(slot)]
-				local u = uuid and Collection:Unit(uuid)
+				local u = uuid and not Collection:Unwanted(uuid) and Collection:Unit(uuid) -- unwanted ones are about to be discarded
 				local data = u and Data.Units[u.unit_id]
 				local anchor, where
 				if data and cfg.On then anchor, where = Collection:PlaceAnchor(slot, u.unit_id) end
@@ -2738,14 +2878,66 @@ if not IS_LOBBY then task.spawn(function()
 	if folder then folder:Destroy() end
 end) end
 
--- random-unit events: X the picked spells as they're handed out
+-- who an auto-used spell goes on: true = it needs no target, nil = nobody fits yet
+function Collection:SpellTarget(id)
+	if Data.IngameSpells[id].apply._t == "instant" then return true end
+	local maxed = {}
+	for _, m in Collection:MyUnits() do
+		if Collection:IsMaxed(m) then table.insert(maxed, m) end
+	end
+	-- Merge needs at least one copy; the rest take any maxed unit, strongest first
+	local best, bestScore = nil, id == "sacrifice" and 0 or -1
+	for _, m in maxed do
+		local score = m._stats.damage.Value
+		if id == "sacrifice" then
+			-- Merge takes every same unit in the target's range: count the non-upgraded copies there
+			local pos, range = m:GetPivot().Position, m._stats.range.Value
+			score = 0
+			for _, other in Collection:MyUnits() do
+				local p = other:GetPivot().Position
+				if other ~= m and other._stats.upgrade.Value == 0 and other._stats.id.Value == m._stats.id.Value
+					and Vector2.new(p.X - pos.X, p.Z - pos.Z).Magnitude <= range then
+					score += 1
+				end
+			end
+		end
+		if score > bestScore then best, bestScore = m, score end
+	end
+	return best
+end
+
+-- Auto Keep / Discard Units: a unit the event handed out that the list says to discard (Astral Summon's are always kept)
+function Collection:Unwanted(uuid)
+	local u = State.AutoKeepUnits and next(State.KeepUnits) and not Collection.Summoned[uuid] and (session.collection.temporary_units or {})[uuid]
+	if not u then return false end
+	local picked = State.KeepUnits[Collection:UnitName(u)] == true
+	return picked == (State.KeepMode == "Discard")
+end
+
+-- random-unit events: X the unwanted units and picked spells as they're handed out, cast the auto-use spells
 if not IS_LOBBY then task.spawn(function()
 	while not closed do
 		task.wait(0.5)
-		if State.AutoDiscard then
-			for slot, id in session.ingame_spells or {} do
-				local spell = Data.IngameSpells[id]
-				if spell and State.DiscardSpells[spell.name] then Collection:Invoke("delete_ingame_spell", slot) end
+		for slot, uuid in session.override_equipped_units or {} do
+			-- the unit that lands where Astral Summon was just cast is the summoned one
+			local cast = Collection.SummonCast[tostring(slot)]
+			if cast then
+				if os.clock() - cast < 10 then Collection.Summoned[uuid] = true end
+				Collection.SummonCast[tostring(slot)] = nil
+			end
+			if Collection:Unwanted(uuid) then Collection:Invoke("delete_ingame_temporary_unit", tostring(slot)) end
+		end
+		for slot, id in session.ingame_spells or {} do
+			local spell = Data.IngameSpells[id]
+			if spell and State.AutoDiscard and State.DiscardSpells[spell.name] then
+				Collection:Invoke("delete_ingame_spell", slot)
+			elseif spell and State.AutoSpells and State.UseSpells[spell.name] and Collection:Money() >= math.ceil(spell.cost) then
+				local target = Collection:SpellTarget(id)
+				if target == true then
+					Collection:Invoke("use_ingame_spell", slot)
+				elseif target then
+					Collection:Invoke("use_ingame_spell", slot, target)
+				end
 			end
 		end
 	end
@@ -2865,6 +3057,7 @@ if not IS_LOBBY then task.spawn(function()
 	task.spawn(function()
 		local loaded, steps, finished = false, {}, false
 		local models, taken, bad = {}, {}, {} -- bad: slot-point spots the server refused
+		local homes = {} -- spawn step -> { uuid, pos } of the model it placed
 		local i, tries = 1, 0
 		local function advance() i, tries = i + 1, 0 end
 		local function retry(why)
@@ -2908,6 +3101,23 @@ if not IS_LOBBY then task.spawn(function()
 				task.wait(0.2)
 			until os.clock() - t0 > 3
 		end
+		-- the unit a step acts on. Fusion (Vego + Carrot -> Vegito) removes both models and adds one with the caster's
+		-- uuid, always where Vego stood (fusion range is the whole map): follow the nearest new unit with that uuid
+		local function stepModel(index)
+			local m, home = models[index], homes[index]
+			if m and not m.Parent and home then
+				local best, bestDist
+				for _, other in Collection:MyUnits() do
+					local d = (other:GetPivot().Position - home.pos).Magnitude
+					if not taken[other] and other._stats.uuid.Value == home.uuid and (not bestDist or d < bestDist) then best, bestDist = other, d end
+				end
+				if best then
+					taken[best], models[index] = true, best
+					return best
+				end
+			end
+			return m
+		end
 
 		while not closed do
 			task.wait(0.5)
@@ -2927,9 +3137,11 @@ if not IS_LOBBY then task.spawn(function()
 			elseif State.PlayMacro and not State.RecordMacro then
 				local step = steps[i]
 				local spawnStep = step.type == "spawn" and step or steps[step.unit]
-				local name = spawnStep and spawnStep.unit_id and Collection:UnitName(spawnStep) or "?"
 				local uuid = step.type == "spawn" and step.unit_id and Collection:MacroUnit(step.unit_id)
-				local m = step.unit and models[step.unit]
+				local m = step.unit and stepModel(step.unit)
+				-- the unit on the map, so a fused Vegito shows as Fused Hero, not the Carrot it was recorded as
+				local unitId = m and m.Parent and m._stats.id.Value or spawnStep and spawnStep.unit_id
+				local name = unitId and Collection:UnitName({ unit_id = unitId }) or "?"
 				local function status(note)
 					MacroStatus:SetDesc(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, name, note))
 				end
@@ -2946,6 +3158,7 @@ if not IS_LOBBY then task.spawn(function()
 						cf = cf or CFrame.new(table.unpack(step.cf))
 						if Collection:Invoke("spawn_unit", uuid, cf) then
 							models[i] = spawnedModel(uuid, cf.Position)
+							homes[i] = models[i] and { uuid = uuid, pos = models[i]:GetPivot().Position }
 							advance()
 						else
 							if key then bad[key] = true end
@@ -3033,7 +3246,8 @@ if not IS_LOBBY then task.spawn(function()
 					end
 				end
 				if abilityDue and attack and ready and not buff -- buff units are Loop Buffs' job
-					and not (attack.custom_client_script and attack.custom_client_script.active_start) then
+					and not (attack.custom_client_script and attack.custom_client_script.active_start)
+					and not State.AbilityIgnore[Collection:UnitName(Collection:Unit(st.uuid.Value) or {})] then
 					Collection:Invoke("use_active_attack", m)
 				end
 			end
@@ -3332,7 +3546,7 @@ task.spawn(function()
 						end
 						SummonStatus:SetDesc(string.format("Pulls: %d  |  Gems spent: %d  |  Gems left: %d%s", pulls, spent, Collection:Gems(),
 							#best > 0 and ("\nBest: " .. table.concat(best, ", ")) or ""))
-						task.wait(1)
+						Collection:SkipSummonReveal()
 					end
 				end
 			end
