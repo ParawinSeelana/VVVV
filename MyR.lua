@@ -1,6 +1,40 @@
 -- Anime Adventures hub (VaderUI)
 repeat task.wait() until game:IsLoaded()
 
+-- the store's image for 5s before the hub loads (Roblox shows the site's .webp as is); skipped when it can't be shown
+pcall(function()
+	local getAsset = getcustomasset or getsynasset
+	local data = game:HttpGet("https://vaderhug.4tunez.com/uploads/images/vaderhug/products/5837fd697f3e2ad393c7fa29d8dc2f86_1793075859.webp?w=750&q=90")
+	if not (getAsset and writefile and makefolder and data ~= "") then return end
+	if not isfolder("Vaderhug") then makefolder("Vaderhug") end
+	writefile("Vaderhug/store.webp", data)
+	local gui = Instance.new("ScreenGui")
+	gui.Name, gui.IgnoreGuiInset, gui.ResetOnSpawn, gui.DisplayOrder = "VaderStore", true, false, 1000000
+	-- a square image over a text strip, at most 400 wide and never past 70% of the screen
+	local card = Instance.new("Frame")
+	card.AnchorPoint, card.Position, card.Size = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5), UDim2.fromScale(0.7, 0.7)
+	card.BackgroundColor3 = Color3.fromRGB(17, 14, 25)
+	card.Parent = gui
+	Instance.new("UIAspectRatioConstraint", card).AspectRatio = 0.88
+	Instance.new("UISizeConstraint", card).MaxSize = Vector2.new(400, 455)
+	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 10)
+	local stroke = Instance.new("UIStroke", card)
+	stroke.Color, stroke.Thickness = Color3.fromRGB(132, 88, 240), 2
+	local image = Instance.new("ImageLabel")
+	image.Size, image.BackgroundTransparency, image.ScaleType = UDim2.fromScale(1, 0.88), 1, Enum.ScaleType.Fit
+	image.Image = getAsset("Vaderhug/store.webp")
+	image.Parent = card
+	Instance.new("UICorner", image).CornerRadius = UDim.new(0, 10)
+	local text = Instance.new("TextLabel")
+	text.Position, text.Size, text.BackgroundTransparency = UDim2.fromScale(0.05, 0.88), UDim2.fromScale(0.9, 0.12), 1
+	text.Text, text.TextColor3, text.Font, text.TextScaled = "Available At Vaderhug.4tunez.com", Color3.fromRGB(240, 236, 250), Enum.Font.GothamBold, true
+	text.Parent = card
+	Instance.new("UITextSizeConstraint", text).MaxTextSize = 20
+	gui.Parent = gethui and gethui() or game:GetService("CoreGui")
+	task.wait(5)
+	gui:Destroy()
+end)
+
 ---------------------------------------------- [ Configs ] ----------------------------------------------
 
 local MAP_NAME = "Anime Adventures"
@@ -542,6 +576,38 @@ local PALETTE = {
 }
 local priorityLists = {} -- render functions, re-run when the theme changes
 
+-- A box plus Import / Export buttons for these controls. Export copies them in the config file's format, so a whole
+-- config pasted into the box imports too (only these controls are taken from it).
+function Collection:AddShare(section, id, label, ids)
+	local only = {}
+	for _, k in ids do only[k] = true end
+	section:AddInput(id, { Title = label .. " JSON", Placeholder = "Paste what Export copied", Default = "", Finished = false })
+	section:AddButton({
+		Title = "Import " .. label,
+		Callback = function()
+			local ok, problem = pcall(function()
+				local data = HttpService:JSONDecode(VaderUI.Options[id].Value)
+				assert(type(data) == "table" and type(data.Options) == "table", "That isn't an export.")
+				assert(Collection:ApplyOptions(data.Options, only) > 0, "Nothing for " .. label .. " in it.")
+			end)
+			Collection:Notify(ok and ("Imported " .. label .. ".") or ("Import failed: " .. tostring(problem):gsub("^.-:%d+: ", "")))
+		end,
+	})
+	section:AddButton({
+		Title = "Export " .. label,
+		Description = "Copies JSON to clipboard.",
+		Callback = function()
+			local all, out = Collection:Snapshot().Options, { Version = 1, Options = {} }
+			for _, k in ids do out.Options[k] = all[k] end
+			local copy = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+			if type(copy) ~= "function" or not pcall(copy, HttpService:JSONEncode(out)) then
+				return Collection:Notify("Couldn't copy to the clipboard.")
+			end
+			Collection:Notify("Copied " .. label .. " settings.")
+		end,
+	})
+end
+
 function Collection:Instance(ClassName, Property)
 	local Object = Instance.new(ClassName)
 	for i, v in Property do
@@ -854,6 +920,7 @@ Collection:AddPriorityList(CardSection, "CardPriority", {
 	},
 	Callback = function(value) State.CardPriority = value end,
 })
+Collection:AddShare(CardSection, "CardShare", "Card Priority", { "CardPriority" })
 
 -- events that hand out random units (April Fools' Fool's Hunt): the pool is server-side, so every unit is offered
 do
@@ -1054,6 +1121,10 @@ Collection:AddPriorityList(DungeonShopSection, "DungeonShopOrder", {
 	Title = "Items", Entries = shopEntries,
 	Description = "Top first. Off = never.",
 	Callback = function(value) State.DungeonShopOrder = value end,
+})
+Collection:AddShare(Tabs.Dungeon:AddSection("Share"), "DungeonShare", "Dungeon", {
+	"DungeonStopLastLife", "DungeonChests", "DungeonShrine", "DungeonPickBy", "DungeonLookahead",
+	"DungeonRoomOrder", "DungeonWeakOrder", "DungeonShopOrder",
 })
 
 --------------------------- [[ Match Tab ]] ---------------------------
@@ -3749,6 +3820,51 @@ function Collection:SaveProfile(force)
 	lastError = nil
 	return true
 end
+-- Validates every known value before applying any. only = a set of ids to take, the rest are ignored; returns how
+-- many were applied
+function Collection:ApplyOptions(options, only)
+	local pending = {}
+	-- Validate every known value before applying any callbacks.
+	for id, saved in pairs(options) do
+		local option = VaderUI.Options[id]
+		if option and (not only or only[id]) then
+			assert(type(saved) == "table" and saved.Type == option.Type, "Invalid control: " .. id)
+			local value = saved.Value
+			if option.Type == "Toggle" then
+				assert(type(value) == "boolean", "Invalid toggle: " .. id)
+			elseif option.Type == "Slider" then
+				assert(type(value) == "number" and value == value and math.abs(value) ~= math.huge, "Invalid slider: " .. id)
+				value = math.clamp(value, option.Min, option.Max)
+			elseif option.Type == "Input" then
+				assert(type(value) == "string", "Invalid input: " .. id)
+			elseif option.Type == "Keybind" then
+				assert(type(value) == "string" and (value == "None" or Enum.KeyCode[value] ~= nil), "Invalid keybind: " .. id)
+				assert(saved.Mode == nil or saved.Mode == "Toggle" or saved.Mode == "Hold" or saved.Mode == "Always", "Invalid keybind mode")
+			elseif option.Type == "Priority" then
+				assert(type(value) == "table", "Invalid priority list: " .. id)
+			elseif option.Type == "Dropdown" then
+				if option.Multi then
+					assert(type(value) == "table", "Invalid dropdown: " .. id)
+				elseif value ~= nil and not table.find(option.Values, value) then
+					value = option.Value
+				end
+			else
+				error("Unsupported config control: " .. id)
+			end
+			-- reroll toggles open a confirm dialog and a resumed recording would overwrite a macro
+			if id == "AutoTraitReroll" or id == "AutoStatReroll" or id == "RecordMacro" then value = false end
+			table.insert(pending, { Option = option, Value = value, Mode = saved.Mode })
+		end
+	end
+	-- Restore enabling toggles last so callbacks see restored parameters.
+	for _, item in ipairs(pending) do
+		if item.Option.Type ~= "Toggle" then item.Option:SetValue(item.Value, item.Mode) end
+	end
+	for _, item in ipairs(pending) do
+		if item.Option.Type == "Toggle" then item.Option:SetValue(item.Value) end
+	end
+	return #pending
+end
 function Collection:LoadProfile()
 	if not canPersist then return false, "Required file APIs are unavailable." end
 	restoring = true
@@ -3756,46 +3872,7 @@ function Collection:LoadProfile()
 		if not isfile(profilePath) then return end
 		local data = HttpService:JSONDecode(readfile(profilePath))
 		assert(type(data) == "table" and data.Version == 1 and type(data.Options) == "table", "Invalid config format")
-		local pending = {}
-		-- Validate every known value before applying any callbacks.
-		for id, saved in pairs(data.Options) do
-			local option = VaderUI.Options[id]
-			if option then
-				assert(type(saved) == "table" and saved.Type == option.Type, "Invalid control: " .. id)
-				local value = saved.Value
-				if option.Type == "Toggle" then
-					assert(type(value) == "boolean", "Invalid toggle: " .. id)
-				elseif option.Type == "Slider" then
-					assert(type(value) == "number" and value == value and math.abs(value) ~= math.huge, "Invalid slider: " .. id)
-					value = math.clamp(value, option.Min, option.Max)
-				elseif option.Type == "Input" then
-					assert(type(value) == "string", "Invalid input: " .. id)
-				elseif option.Type == "Keybind" then
-					assert(type(value) == "string" and (value == "None" or Enum.KeyCode[value] ~= nil), "Invalid keybind: " .. id)
-					assert(saved.Mode == nil or saved.Mode == "Toggle" or saved.Mode == "Hold" or saved.Mode == "Always", "Invalid keybind mode")
-				elseif option.Type == "Priority" then
-					assert(type(value) == "table", "Invalid priority list: " .. id)
-				elseif option.Type == "Dropdown" then
-					if option.Multi then
-						assert(type(value) == "table", "Invalid dropdown: " .. id)
-					elseif value ~= nil and not table.find(option.Values, value) then
-						value = option.Value
-					end
-				else
-					error("Unsupported config control: " .. id)
-				end
-				-- reroll toggles open a confirm dialog and a resumed recording would overwrite a macro
-				if id == "AutoTraitReroll" or id == "AutoStatReroll" or id == "RecordMacro" then value = false end
-				table.insert(pending, { Option = option, Value = value, Mode = saved.Mode })
-			end
-		end
-		-- Restore enabling toggles last so callbacks see restored parameters.
-		for _, item in ipairs(pending) do
-			if item.Option.Type ~= "Toggle" then item.Option:SetValue(item.Value, item.Mode) end
-		end
-		for _, item in ipairs(pending) do
-			if item.Option.Type == "Toggle" then item.Option:SetValue(item.Value) end
-		end
+		Collection:ApplyOptions(data.Options)
 	end)
 	restoring = false
 	profileReady = ok
