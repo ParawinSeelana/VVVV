@@ -3365,8 +3365,9 @@ if not IS_LOBBY then task.spawn(function()
 		while not closed do
 			task.wait(1)
 			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
-				-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order
-				local rank, best = {}, nil
+				-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order. Only what the
+				-- money covers now: while a ticked unit saves up for its next upgrade, the money goes on down the list
+				local rank, best, money = {}, nil, Collection:Money()
 				for i, entry in State.UpgradePriority do
 					if entry.on then rank[entry.id] = i end
 				end
@@ -3374,7 +3375,7 @@ if not IS_LOBBY then task.spawn(function()
 					local cost = Collection:UpgradeCost(m)
 					local u = Collection:Unit(m._stats.uuid.Value) or {}
 					-- Upgrade Only Kept: units the Keep list wouldn't keep stay as they are
-					if cost and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
+					if cost and cost <= money and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
 						local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
 						local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
 							or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
@@ -3383,7 +3384,7 @@ if not IS_LOBBY then task.spawn(function()
 						end
 					end
 				end
-				if best and Collection:Money() >= best.cost then Collection:Invoke("upgrade_unit_ingame", best.model) end
+				if best then Collection:Invoke("upgrade_unit_ingame", best.model) end
 			end
 
 			local abilityDue = State.AutoAbility and os.clock() - lastAbility > 3
