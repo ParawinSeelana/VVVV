@@ -156,13 +156,16 @@ function Collection:Gems() return LP._stats.gem_amount.Value end
 function Collection:Money() return LP._stats.resource.Value end
 function Collection:InPad() return LP:FindFirstChild("AlreadyInLobby") and LP.AlreadyInLobby.Value end
 -- the summon reveal waits for a real click (UserInputService.InputBegan) on every unit, and the game's auto-sell only
--- runs after the last one: click through until no reveal has been up for 2s. VirtualUser clicks don't reach InputBegan
+-- runs after the last one: click through until no reveal has been up for 2s. VirtualUser clicks don't reach InputBegan.
+-- Overlapping summons share summon_ui.hatching and the first to finish clears it, so a unit still up (open_particles
+-- on the character) or a star intro (star_particles in the camera) counts too
 function Collection:SkipSummonReveal()
 	local idle = 0
 	while idle < 2 and not closed do
-		if Client.GUIService.summon_ui.hatching then
+		local char, cam = LP.Character, workspace.CurrentCamera
+		if Client.GUIService.summon_ui.hatching or (char and char:FindFirstChild("open_particles")) or cam:FindFirstChild("star_particles") then
 			idle = 0
-			local v = workspace.CurrentCamera.ViewportSize
+			local v = cam.ViewportSize
 			Services.VirtualInputManager:SendMouseButtonEvent(v.X / 2, v.Y / 2, 0, true, game, 0)
 			Services.VirtualInputManager:SendMouseButtonEvent(v.X / 2, v.Y / 2, 0, false, game, 0)
 		else
@@ -2963,7 +2966,8 @@ function Collection:SpellTarget(id)
 	if Data.IngameSpells[id].apply._t == "instant" then return true end
 	local maxed = {}
 	for _, m in Collection:MyUnits() do
-		if Collection:IsMaxed(m) then table.insert(maxed, m) end
+		-- never Merge money units: the farms would eat each other
+		if Collection:IsMaxed(m) and not (id == "sacrifice" and Collection:IsFarm(m._stats.id.Value)) then table.insert(maxed, m) end
 	end
 	-- Merge needs at least one copy; the rest take any maxed unit, strongest first
 	local best, bestScore = nil, id == "sacrifice" and 0 or -1
@@ -3481,7 +3485,16 @@ task.spawn(function()
 		local res = dd._resources or {}
 		local shop = dd.current_shops and dd.current_shops[1]
 		if State.AutoDungeon then
-			if dd._dead then
+			-- died or the run ended in a dungeon match: straight to the lobby, the death screen is cleared there
+			if not IS_LOBBY and Loader.LevelData and Loader.LevelData._dungeon and (dd._dead or (not dd._started and dungeonMatchOver)) then
+				if os.clock() - lastLeave > 20 then
+					lastLeave = os.clock()
+					note = dd._dead and ("Died at depth " .. tostring(dd._dead.depth_reached) .. " - back to the lobby") or "Run over - back to the lobby"
+					if Collection:TeleportDelay(note, function() return State.AutoDungeon end) then
+						Collection:Invoke("teleport_back_to_lobby")
+					end
+				end
+			elseif dd._dead then
 				note = "Died at depth " .. tostring(dd._dead.depth_reached) .. " - continuing"
 				act("dungeon_continue_death")
 			elseif shop and shop._t == ROOM.SHOP then
@@ -3533,13 +3546,6 @@ task.spawn(function()
 					VaderUI.Options.DungeonStart:SetValue(false)
 					note = "Couldn't start a run (out of Dungeon Run Keys?)"
 					Collection:Notify("Dungeon: " .. note)
-				end
-			elseif not dd._started and not IS_LOBBY and dungeonMatchOver and Loader.LevelData and Loader.LevelData._dungeon
-				and os.clock() - lastLeave > 20 then
-				lastLeave = os.clock()
-				note = "Run over - back to the lobby"
-				if Collection:TeleportDelay(note, function() return State.AutoDungeon end) then
-					Collection:Invoke("teleport_back_to_lobby")
 				end
 			end
 		end
@@ -3613,19 +3619,21 @@ task.spawn(function()
 				elseif count + n > capacity then
 					stop("Unit storage is full (" .. count .. "/" .. capacity .. ").")
 				else
+					-- two summons at once when gems and storage cover both: their reveals overlap, 20 a round on x10
+					local calls = (Collection:Gems() - cost * 2 >= State.KeepGems and count + n * 2 <= capacity) and 2 or 1
 					local beforeGems, before = Collection:Gems(), {}
 					for uuid in Collection:Owned() do before[uuid] = true end
-					Collection:Invoke("buy_from_banner", State.Banner, payArg)
-					local t0, changed = os.clock(), false
+					for _ = 1, calls do task.spawn(Collection.Invoke, Collection, "buy_from_banner", State.Banner, payArg) end
+					local t0, got = os.clock(), 0
 					repeat
 						task.wait(0.25)
-						if Collection:Gems() ~= beforeGems then changed = true end
-						for uuid in Collection:Owned() do if not before[uuid] then changed = true break end end
-					until changed or os.clock() - t0 > 8 or closed
-					if not changed then
+						got = 0
+						for uuid in Collection:Owned() do if not before[uuid] then got += 1 end end
+					until got >= n * calls or os.clock() - t0 > 8 or closed
+					if got == 0 and Collection:Gems() == beforeGems then
 						stop("Summon didn't go through (banner currency, storage or cooldown).")
 					else
-						pulls += n
+						pulls += got
 						spent += math.max(beforeGems - Collection:Gems(), 0)
 						for uuid, u in Collection:Owned() do
 							local rarity = Data.Units[u.unit_id] and Data.Units[u.unit_id].rarity
