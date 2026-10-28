@@ -707,8 +707,8 @@ function Collection:AddPriorityList(section, id, options)
 				table.insert(merged, { id = entry.id, on = entry.on ~= false })
 			end
 		end
-		for _, entry in default do
-			if not seen[entry.id] then table.insert(merged, { id = entry.id, on = entry.on }) end
+		for i, entry in default do
+			if not seen[entry.id] then table.insert(merged, math.min(i, #merged + 1), { id = entry.id, on = entry.on }) end
 		end
 		self.Value = merged
 		changed()
@@ -768,8 +768,9 @@ JoinSection:AddSlider("TeleportDelay", {
 Collection:AddPriorityList(JoinSection, "JoinPriority", {
 	Title = "Join Priority",
 	Description = "Top first. Unticked = skipped.",
-	Rows = 10,
+	Rows = 11,
 	Entries = {
+		{ id = "Dungeon", label = "Dungeon Run" },
 		{ id = "DailyChallenge", label = "Daily Challenge" },
 		{ id = "Challenge", label = "Challenge" },
 		{ id = "Contract", label = "Contract" },
@@ -2447,6 +2448,7 @@ function Collection:JoinStage(mode)
 	return pad, "Starting " .. mode .. ": " .. label
 end
 
+local dungeonTurn = false -- Join Priority reached Dungeon Run: the dungeon loop may start a run / enter a room from the lobby
 if IS_LOBBY then
 	Collection:RefreshChallenge()
 	Collection:Track(fromServer.normal_challenge_remaining_time_changed.OnClientEvent:Connect(function(seconds)
@@ -2458,12 +2460,14 @@ if IS_LOBBY then
 	task.spawn(function()
 		task.wait(5)
 		while not closed do
-			-- an auto dungeon run (or one about to start) has the lobby to itself
-			if (State.AutoJoinDailyChallenge or State.AutoJoinChallenge or State.AutoContract or State.AutoPortal or State.AutoJoinEvent or State.AutoMansion or Collection:AnyModeOn()) and not Collection:InPad()
-				and not (State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)) then
-				local pad, msg
+			-- an auto dungeon run (or one about to start) gets the lobby when Join Priority reaches it
+			local dungeonOn = State.AutoDungeon and (Collection:DungeonData()._started or State.DungeonStart)
+			if (State.AutoJoinDailyChallenge or State.AutoJoinChallenge or State.AutoContract or State.AutoPortal or State.AutoJoinEvent or State.AutoMansion or dungeonOn or Collection:AnyModeOn())
+				and not Collection:InPad() then
+				local pad, msg, dungeon
 				local notes = {}
 				local tries = {
+					Dungeon = { dungeonOn, function() dungeon = true return nil, "Dungeon Run: its turn (Dungeon tab)." end },
 					DailyChallenge = { State.AutoJoinDailyChallenge, function() return Collection:JoinChallenge(true) end },
 					Challenge = { State.AutoJoinChallenge, function() return Collection:JoinChallenge() end },
 					Contract = { State.AutoContract, Collection.JoinContract },
@@ -2474,13 +2478,14 @@ if IS_LOBBY then
 				for _, mode in MODES do tries[mode] = { State.Join[mode], function() return Collection:JoinStage(mode) end } end
 				-- Join Priority: top first, unticked skipped
 				for _, entry in State.JoinPriority do
-					if pad then break end
+					if pad or dungeon then break end
 					local try = tries[entry.id]
 					if entry.on and try[1] then
 						pad, msg = try[2](Collection)
 						if msg then table.insert(notes, msg) end
 					end
 				end
+				dungeonTurn = dungeon == true
 				if #notes > 0 then
 					JoinStatus:SetDesc(table.concat(notes, "\n"))
 					eventNote = table.concat(notes, "\n")
@@ -3641,6 +3646,8 @@ task.spawn(function()
 		conn:Disconnect()
 		task.wait(0.3) -- let the game's own handler store the new data
 	end
+	-- the lobby is the dungeon's when Join Priority reaches Dungeon Run
+	local function lobbyFree() return IS_LOBBY and dungeonTurn and not Collection:InPad() end
 	while not closed do
 		task.wait(1)
 		local dd = Collection:DungeonData()
@@ -3690,17 +3697,17 @@ task.spawn(function()
 				local accept = State.DungeonShrine == "Accept" or (State.DungeonShrine == "Accept if no curse" and not cursed)
 				note = accept and "Shrine: accepted" or "Shrine: denied"
 				act(accept and "dungeon_shrine_accept" or "dungeon_continue_shop")
-			elseif dd._started and (IS_LOBBY or dungeonMatchOver) and os.clock() - lastEnter > 20 then
+			elseif dd._started and (dungeonMatchOver or lobbyFree()) and os.clock() - lastEnter > 20 then
 				local choice, room = Collection:PickRoom(dd)
 				-- a lost room stays picked and costs a heart per retry; at 0 the run is gone
 				if State.DungeonStopLastLife and dd.selected_next and (dd.selected_next.lives or 5) <= 1 then
 					note = "Room " .. tostring(choice) .. ": 1 heart left - stopped, retry it yourself"
-				elseif choice and Collection:TeleportDelay("Entering room " .. choice, function() return State.AutoDungeon end) then
+				elseif choice and Collection:TeleportDelay("Entering room " .. choice, function() return State.AutoDungeon and (dungeonMatchOver or lobbyFree()) end) then
 					lastEnter = os.clock()
 					note = "Entering room " .. choice .. ": " .. Collection:DescribeRoom(room)
 					act("dungeon_enter_room", choice)
 				end
-			elseif not dd._started and IS_LOBBY and State.DungeonStart and not Collection:InPad() and os.clock() - lastStart > 10 then
+			elseif not dd._started and State.DungeonStart and lobbyFree() and os.clock() - lastStart > 10 then
 				lastStart = os.clock()
 				note = "Starting a run"
 				act("dungeon_start")
