@@ -3881,32 +3881,36 @@ function Collection:ApplyOptions(options, only)
 	for id, saved in pairs(options) do
 		local option = VaderUI.Options[id]
 		if option and (not only or only[id]) then
-			assert(type(saved) == "table" and saved.Type == option.Type, "Invalid control: " .. id)
-			local value = saved.Value
-			if option.Type == "Toggle" then
-				assert(type(value) == "boolean", "Invalid toggle: " .. id)
-			elseif option.Type == "Slider" then
-				assert(type(value) == "number" and value == value and math.abs(value) ~= math.huge, "Invalid slider: " .. id)
-				value = math.clamp(value, option.Min, option.Max)
-			elseif option.Type == "Input" then
-				assert(type(value) == "string", "Invalid input: " .. id)
-			elseif option.Type == "Keybind" then
-				assert(type(value) == "string" and (value == "None" or Enum.KeyCode[value] ~= nil), "Invalid keybind: " .. id)
-				assert(saved.Mode == nil or saved.Mode == "Toggle" or saved.Mode == "Hold" or saved.Mode == "Always", "Invalid keybind mode")
-			elseif option.Type == "Priority" then
-				assert(type(value) == "table", "Invalid priority list: " .. id)
-			elseif option.Type == "Dropdown" then
-				if option.Multi then
-					assert(type(value) == "table", "Invalid dropdown: " .. id)
-				elseif value ~= nil and not table.find(option.Values, value) then
-					value = option.Value
+			-- a value this build can't read (saved by another build) keeps its default; the rest still loads
+			pcall(function()
+				assert(type(saved) == "table" and saved.Type == option.Type, "Invalid control: " .. id)
+				local value = saved.Value
+				if option.Type == "Toggle" then
+					assert(type(value) == "boolean", "Invalid toggle: " .. id)
+				elseif option.Type == "Slider" then
+					assert(type(value) == "number" and value == value and math.abs(value) ~= math.huge, "Invalid slider: " .. id)
+					value = math.clamp(value, option.Min, option.Max)
+				elseif option.Type == "Input" then
+					assert(type(value) == "string", "Invalid input: " .. id)
+				elseif option.Type == "Keybind" then
+					assert(type(value) == "string" and (value == "None" or Enum.KeyCode[value] ~= nil), "Invalid keybind: " .. id)
+					assert(saved.Mode == nil or saved.Mode == "Toggle" or saved.Mode == "Hold" or saved.Mode == "Always", "Invalid keybind mode")
+				elseif option.Type == "Priority" then
+					assert(type(value) == "table", "Invalid priority list: " .. id)
+				elseif option.Type == "Dropdown" then
+					if option.Multi then
+						if type(value) == "string" then value = { [value] = true } end -- older builds saved one pick
+						assert(type(value) == "table", "Invalid dropdown: " .. id)
+					elseif value ~= nil and not table.find(option.Values, value) then
+						value = option.Value
+					end
+				else
+					error("Unsupported config control: " .. id)
 				end
-			else
-				error("Unsupported config control: " .. id)
-			end
-			-- reroll toggles open a confirm dialog and a resumed recording would overwrite a macro
-			if id == "AutoTraitReroll" or id == "AutoStatReroll" or id == "RecordMacro" then value = false end
-			table.insert(pending, { Option = option, Value = value, Mode = saved.Mode })
+				-- reroll toggles open a confirm dialog and a resumed recording would overwrite a macro
+				if id == "AutoTraitReroll" or id == "AutoStatReroll" or id == "RecordMacro" then value = false end
+				table.insert(pending, { Option = option, Value = value, Mode = saved.Mode })
+			end)
 		end
 	end
 	-- Restore enabling toggles last so callbacks see restored parameters.
