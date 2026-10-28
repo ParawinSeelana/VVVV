@@ -52,7 +52,7 @@ local State = {
 	AutoDiscard = false, DiscardSpells = {}, AutoSpells = false, UseSpells = {}, AutoKeepUnits = false, KeepMode = "Keep", KeepUnits = {}, UpgradeOnlyKept = false,
 	AutoContract = false, ContractJoinBy = "Normal", ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
-	AutoEventShop = false, EventShopItems = {},
+	AutoEventShop = false, EventShopItems = {}, AutoMadokaShop = false, MadokaShopItems = {},
 	-- dungeon
 	AutoDungeon = false, DungeonStart = false, DungeonStopLastLife = false, DungeonChests = "Save for the end", DungeonShrine = "Accept if no curse",
 	DungeonPickBy = "Rewards, then weakness", DungeonLookahead = true,
@@ -541,6 +541,17 @@ for key, data in Data.ItemsForSaleEvent do
 	end
 end
 table.sort(eventShopValues)
+
+-- Madoka shop: picked by item name. The server sends the day's stock, so the known items are always listed: a pick
+-- outside the list would be dropped by a config save in a match, where the shop may not be loaded
+local function itemName(id) return Data.Items[id] and Data.Items[id].name or id end
+local madokaShopValues = {}
+for _, id in { "star_remnant_limited", "StarFruitCapsule", "dungeon_key" } do table.insert(madokaShopValues, itemName(id)) end
+pcall(function()
+	for _, entry in Client.MadokaShopServiceClient.shop_items_for_sale or {} do
+		if not table.find(madokaShopValues, itemName(entry.id)) then table.insert(madokaShopValues, itemName(entry.id)) end
+	end
+end)
 
 function Collection:EventResource(id)
 	local value = LP._stats:FindFirstChild("_resource" .. tostring(id))
@@ -1031,6 +1042,17 @@ EventShopSection:AddToggle("AutoEventShop", {
 	Callback = function(value) State.AutoEventShop = value end,
 })
 
+local MadokaShopSection = Tabs.Event:AddSection("Madoka Shop")
+MadokaShopSection:AddDropdown("MadokaShopItems", {
+	Title = "Items", Values = madokaShopValues, Multi = true, Default = {},
+	Callback = function(value) State.MadokaShopItems = value end,
+})
+MadokaShopSection:AddToggle("AutoMadokaShop", {
+	Title = "Auto Buy", Default = false,
+	Description = "Buys picked items while in stock.",
+	Callback = function(value) State.AutoMadokaShop = value end,
+})
+
 --------------------------- [[ Dungeon Tab ]] ---------------------------
 
 local roomEntries = {
@@ -1229,7 +1251,7 @@ function Collection:SetSlotPosition(slot)
 end
 
 for _, slot in Data.GameplaySettings.UNIT_SLOTS do
-	local cfg = { On = true, Mode = "Enemy path", Max = 6 }
+	local cfg = { On = true, Mode = "Enemy path", Max = 6, UpgradeWave = 0 }
 	State.Slots[slot] = cfg
 	local equipped = Collection:Equipped()
 	local u = Collection:Unit(equipped[slot] or equipped[tonumber(slot)] or "")
@@ -1248,6 +1270,11 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 		Title = "Max Placed", Default = 6, Min = 1, Max = 20, Rounding = 0,
 		Description = cap and ("Max " .. cap .. ", none in Fool's Hunt.") or nil,
 		Callback = function(value) cfg.Max = value end,
+	})
+	section:AddSlider("Slot" .. slot .. "UpgradeWave", {
+		Title = "Upgrade After Wave", Default = 0, Min = 0, Max = 200, Rounding = 0,
+		Description = "Auto Upgrade starts this slot at this wave. 0 = any time.",
+		Callback = function(value) cfg.UpgradeWave = value end,
 	})
 	section:AddButton({
 		Title = "Set Position Here",
@@ -3401,12 +3428,21 @@ if not IS_LOBBY then task.spawn(function()
 					for i, entry in State.UpgradePriority do
 						if entry.on then rank[entry.id] = i end
 					end
+					-- Upgrade After Wave: each slot's units wait for their slot's wave
+					local equipped, slotWave, wave, held = Collection:Equipped(), {}, Collection:Wave(), nil
+					for _, slot in Data.GameplaySettings.UNIT_SLOTS do
+						local uuid = equipped[slot] or equipped[tonumber(slot)]
+						if uuid then slotWave[uuid] = State.Slots[slot].UpgradeWave end
+					end
 					for _, m in Collection:MyUnits() do
 						local cost = Collection:UpgradeCost(m)
 						local u = Collection:Unit(m._stats.uuid.Value) or {}
 						-- Upgrade Only Kept: units the Keep list wouldn't keep stay as they are; Upgrade Until: none past that upgrade
 						local cap = math.min(State.UpgradeUntil, u.unit_id and State.UpgradeCaps[Collection:UnitName(u)] or 13)
-						if cost and m._stats.upgrade.Value < cap and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
+						local after = slotWave[m._stats.uuid.Value] or 0
+						if cost and wave < after then
+							held = math.min(held or after, after)
+						elseif cost and m._stats.upgrade.Value < cap and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
 							if cost > money then
 								-- the cheapest one still saving up goes next
 								if not waiting or cost < waiting.cost then waiting = { model = m, cost = cost } end
@@ -3427,6 +3463,8 @@ if not IS_LOBBY then task.spawn(function()
 							or "Server refused upgrading %s to %d (%s¥)", name(best.model), level, Collection:Comma(best.cost))
 					elseif waiting then
 						note = string.format("Next: %s - waiting for %s¥", name(waiting.model), Collection:Comma(waiting.cost))
+					elseif held then
+						note = string.format("Waiting for wave %d (Upgrade After Wave).", held)
 					else
 						note = "Nothing to upgrade: every placed unit is maxed or at its cap."
 					end
@@ -3711,6 +3749,36 @@ task.spawn(function()
 					end
 				end
 			end
+		end
+	end
+end)
+
+--------------------------- [[ Madoka Shop ]] ---------------------------
+
+-- one of each picked item per pass while the day's stock lasts and the cost item covers it
+task.spawn(function()
+	local refused = {} -- shop key -> the shop day the server refused it; tried again after the restock
+	while not closed do
+		task.wait(3)
+		if State.AutoMadokaShop then
+			pcall(function()
+				local shop = Client.MadokaShopServiceClient
+				local bought = (session.profile_data.madoka_shop_data or {}).bought_items or {}
+				for key, entry in shop.shop_items_for_sale or {} do
+					local cost = entry.item_cost
+					local have = session.inventory:get_number_of_owned_item(cost.item_id) or 0
+					if State.MadokaShopItems[itemName(entry.id)] and refused[key] ~= shop.madoka_shop_interval
+						and (entry.stock or 0) > (bought[key] or 0) and have >= cost.amount then
+						Collection:Invoke("buy_madoka_shop_item", key, "1")
+						task.wait(1)
+						if (session.inventory:get_number_of_owned_item(cost.item_id) or 0) < have then
+							Collection:Notify("Bought " .. itemName(entry.id))
+						else
+							refused[key] = shop.madoka_shop_interval
+						end
+					end
+				end
+			end)
 		end
 	end
 end)
