@@ -61,7 +61,8 @@ local State = {
 	MacroName = nil, AutoSwitchMacro = false, MacroSlotSpots = false,
 	-- match
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
-	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradePriority = {}, UpgradeOrder = "Cheapest first",
+	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeUntil = 13, UpgradePriority = {}, UpgradeOrder = "Cheapest first",
+	UpgradeCaps = {}, -- unit name -> stop at this upgrade
 	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
 	LobbyAtWave = false, LobbyWave = 30,
 	-- auto play
@@ -1256,10 +1257,17 @@ for _, slot in Data.GameplaySettings.UNIT_SLOTS do
 end
 
 local UpgradeSection = Tabs.AutoPlay:AddSection("Upgrade")
+-- why Auto Upgrade is or isn't upgrading right now, so a customer's screenshot shows it
+local UpgradeStatus = UpgradeSection:AddParagraph({ Title = "Status", Content = IS_LOBBY and "In the lobby." or "Waiting..." })
 UpgradeSection:AddToggle("AutoUpgrade", {
 	Title = "Auto Upgrade", Default = false,
 	Description = "Waits for the macro to finish.",
 	Callback = function(value) State.AutoUpgrade = value end,
+})
+UpgradeSection:AddSlider("UpgradeUntil", {
+	Title = "Upgrade Until", Default = 13, Min = 1, Max = 13, Rounding = 0,
+	Description = "Stops at this upgrade. 13 = max.",
+	Callback = function(value) State.UpgradeUntil = value end,
 })
 do
 	local entries = {}
@@ -1280,6 +1288,18 @@ UpgradeSection:AddToggle("PlaceBeforeUpgrading", {
 	Description = "Upgrades wait for Auto Place.",
 	Callback = function(value) State.PlaceBeforeUpgrade = value end,
 })
+
+-- Auto Upgrade stops each unit at its own cap (and never past Upgrade Until); your team at hub load, by name
+if #equippedNames > 0 then
+	local CapSection = Tabs.AutoPlay:AddSection("Upgrade Per Unit Cap")
+	for _, name in equippedNames do
+		CapSection:AddSlider("UpgradeCap_" .. name, {
+			Title = name, Default = 13, Min = 0, Max = 13, Rounding = 0,
+			Description = "Stops at this upgrade. 13 = max.",
+			Callback = function(value) State.UpgradeCaps[name] = value end,
+		})
+	end
+end
 --------------------------- [[ Ability Tab ]] ---------------------------
 
 local AbilitySection = Tabs.Ability:AddSection("Abilities")
@@ -2457,12 +2477,13 @@ end
 
 --------------------------- [[ Match ]] ---------------------------
 
+-- placed units only: not minions, nor drones (Elyssia (Abyssal)'s eels carry her uuid and die every ~10s)
 function Collection:MyUnits()
 	local list = {}
 	for _, m in workspace:FindFirstChild("_UNITS") and workspace._UNITS:GetChildren() or {} do
 		local st = m:FindFirstChild("_stats")
 		if st and st:FindFirstChild("player") and st.player.Value == LP and st:FindFirstChild("uuid")
-			and not CollectionService:HasTag(m, "minion_units") then
+			and not CollectionService:HasTag(m, "minion_units") and not CollectionService:HasTag(m, "player_drone_unit") then
 			table.insert(list, m)
 		end
 	end
@@ -3364,77 +3385,108 @@ if not IS_LOBBY then task.spawn(function()
 		end))
 		while not closed do
 			task.wait(1)
-			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
-				-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order. Only what the
-				-- money covers now: while a ticked unit saves up for its next upgrade, the money goes on down the list
-				local rank, best, money = {}, nil, Collection:Money()
-				for i, entry in State.UpgradePriority do
-					if entry.on then rank[entry.id] = i end
+			-- one error in a tick must not end the loop: Auto Upgrade would stop for the rest of the match
+			local ok, problem = pcall(function()
+				local note
+				if not State.AutoUpgrade then
+					note = "Auto Upgrade is off."
+				elseif macroPending then
+					note = "Waiting for the macro to finish."
+				elseif State.AutoPlace and State.PlaceBeforeUpgrade and placePending then
+					note = "Waiting for Auto Place to place every slot (Place Before Upgrading is on)."
+				else
+					-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order. Only what the
+					-- money covers now: while a ticked unit saves up for its next upgrade, the money goes on down the list
+					local rank, best, money, waiting = {}, nil, Collection:Money(), nil
+					for i, entry in State.UpgradePriority do
+						if entry.on then rank[entry.id] = i end
+					end
+					for _, m in Collection:MyUnits() do
+						local cost = Collection:UpgradeCost(m)
+						local u = Collection:Unit(m._stats.uuid.Value) or {}
+						-- Upgrade Only Kept: units the Keep list wouldn't keep stay as they are; Upgrade Until: none past that upgrade
+						local cap = math.min(State.UpgradeUntil, u.unit_id and State.UpgradeCaps[Collection:UnitName(u)] or 13)
+						if cost and m._stats.upgrade.Value < cap and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
+							if cost > money then
+								-- the cheapest one still saving up goes next
+								if not waiting or cost < waiting.cost then waiting = { model = m, cost = cost } end
+							else
+								local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
+								local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
+									or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
+								if not best or r < best.rank or (r == best.rank and score > best.score) then
+									best = { model = m, cost = cost, score = score, rank = r }
+								end
+							end
+						end
+					end
+					local function name(m) return Collection:UnitName({ unit_id = m._stats.id.Value }) end
+					if best then
+						local level = best.model._stats.upgrade.Value + 1
+						note = string.format(Collection:Invoke("upgrade_unit_ingame", best.model) and "Upgraded %s to %d (%s¥)"
+							or "Server refused upgrading %s to %d (%s¥)", name(best.model), level, Collection:Comma(best.cost))
+					elseif waiting then
+						note = string.format("Next: %s - waiting for %s¥", name(waiting.model), Collection:Comma(waiting.cost))
+					else
+						note = "Nothing to upgrade: every placed unit is maxed or at its cap."
+					end
 				end
+				Collection:Elevate() -- the cost checks ran game code, which strips the UI write permission
+				UpgradeStatus:SetDesc(note)
+
+				local abilityDue = State.AutoAbility and os.clock() - lastAbility > 3
+				if abilityDue then lastAbility = os.clock() end
+				local buffs = {} -- active id -> { time, cooldown, lastCast, loopers }: one per buff unit, read each tick
 				for _, m in Collection:MyUnits() do
-					local cost = Collection:UpgradeCost(m)
-					local u = Collection:Unit(m._stats.uuid.Value) or {}
-					-- Upgrade Only Kept: units the Keep list wouldn't keep stay as they are
-					if cost and cost <= money and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
-						local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
-						local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
-							or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
-						if not best or r < best.rank or (r == best.rank and score > best.score) then
-							best = { model = m, cost = cost, score = score, rank = r }
+					local ok, activeId = pcall(Core.UnitServiceCore.get_active_id, m)
+					local attack = ok and activeId and Data.Attacks[activeId]
+					-- the game's own auto-active check, so a recorded ability step is a real cast, not a 3s retry
+					local st = m._stats
+					local since = st:FindFirstChild("last_active_cast") and tick() - st.last_active_cast.Value
+					local cd = st:FindFirstChild("active_attack_cooldown")
+					local ready = since and cd and cd.Value - since <= 0
+					local buff = Collection:BuffOf(attack)
+					if buff and since and cd then
+						local g = buffs[activeId] or { time = buffTimes[activeId] or buff.time, cooldown = 0, lastCast = -math.huge, loopers = {} }
+						buffs[activeId] = g
+						g.cooldown = math.max(g.cooldown, cd.Value)
+						g.lastCast = math.max(g.lastCast, st.last_active_cast.Value)
+						-- the game's own Auto casts it the moment it's ready, so the loop leaves it be
+						if not m:GetAttribute("_auto_active") then
+							table.insert(g.loopers, { m = m, readyAt = st.last_active_cast.Value + cd.Value })
+						end
+					end
+					if abilityDue and attack and ready and not buff -- buff units are Loop Buffs' job
+						and not (attack.custom_client_script and attack.custom_client_script.active_start)
+						and not State.AbilityIgnore[Collection:UnitName(Collection:Unit(st.uuid.Value) or {})] then
+						Collection:Invoke("use_active_attack", m)
+					end
+				end
+				-- Loop Buffs: the copies take turns spread evenly over the cooldown (4 copies of a 64s cooldown: one every 16s), so
+				-- each caster still holds the last buff when it casts and every unit gets recast right around its buff ending.
+				-- Never closer than half a buff apart, or casts would land on units still holding one. All timings are read live.
+				local now = tick()
+				for id, g in buffs do
+					if State.LoopBuffs and #g.loopers > 0 and not pendingBuff[id] then
+						local spacing = math.max(g.cooldown / #g.loopers, (g.time + 0.3) / 2)
+						table.sort(g.loopers, function(a, b) return a.readyAt < b.readyAt end)
+						local pick = g.loopers[1] -- the copy that's waited longest
+						local at = math.max(g.lastCast + spacing, pick.readyAt + 0.05, now)
+						if at - now < 1.2 then
+							pendingBuff[id] = true
+							task.delay(at - now, function()
+								if not closed and State.LoopBuffs and pick.m.Parent then Collection:Invoke("use_active_attack", pick.m) end
+								-- the cast can take a moment to show in last_active_cast; until then the next turn reads as due
+								task.wait(1)
+								pendingBuff[id] = nil
+							end)
 						end
 					end
 				end
-				if best then Collection:Invoke("upgrade_unit_ingame", best.model) end
-			end
-
-			local abilityDue = State.AutoAbility and os.clock() - lastAbility > 3
-			if abilityDue then lastAbility = os.clock() end
-			local buffs = {} -- active id -> { time, cooldown, lastCast, loopers }: one per buff unit, read each tick
-			for _, m in Collection:MyUnits() do
-				local ok, activeId = pcall(Core.UnitServiceCore.get_active_id, m)
-				local attack = ok and activeId and Data.Attacks[activeId]
-				-- the game's own auto-active check, so a recorded ability step is a real cast, not a 3s retry
-				local st = m._stats
-				local since = st:FindFirstChild("last_active_cast") and tick() - st.last_active_cast.Value
-				local cd = st:FindFirstChild("active_attack_cooldown")
-				local ready = since and cd and cd.Value - since <= 0
-				local buff = Collection:BuffOf(attack)
-				if buff and since and cd then
-					local g = buffs[activeId] or { time = buffTimes[activeId] or buff.time, cooldown = 0, lastCast = -math.huge, loopers = {} }
-					buffs[activeId] = g
-					g.cooldown = math.max(g.cooldown, cd.Value)
-					g.lastCast = math.max(g.lastCast, st.last_active_cast.Value)
-					-- the game's own Auto casts it the moment it's ready, so the loop leaves it be
-					if not m:GetAttribute("_auto_active") then
-						table.insert(g.loopers, { m = m, readyAt = st.last_active_cast.Value + cd.Value })
-					end
-				end
-				if abilityDue and attack and ready and not buff -- buff units are Loop Buffs' job
-					and not (attack.custom_client_script and attack.custom_client_script.active_start)
-					and not State.AbilityIgnore[Collection:UnitName(Collection:Unit(st.uuid.Value) or {})] then
-					Collection:Invoke("use_active_attack", m)
-				end
-			end
-			-- Loop Buffs: the copies take turns spread evenly over the cooldown (4 copies of a 64s cooldown: one every 16s), so
-			-- each caster still holds the last buff when it casts and every unit gets recast right around its buff ending.
-			-- Never closer than half a buff apart, or casts would land on units still holding one. All timings are read live.
-			local now = tick()
-			for id, g in buffs do
-				if State.LoopBuffs and #g.loopers > 0 and not pendingBuff[id] then
-					local spacing = math.max(g.cooldown / #g.loopers, (g.time + 0.3) / 2)
-					table.sort(g.loopers, function(a, b) return a.readyAt < b.readyAt end)
-					local pick = g.loopers[1] -- the copy that's waited longest
-					local at = math.max(g.lastCast + spacing, pick.readyAt + 0.05, now)
-					if at - now < 1.2 then
-						pendingBuff[id] = true
-						task.delay(at - now, function()
-							if not closed and State.LoopBuffs and pick.m.Parent then Collection:Invoke("use_active_attack", pick.m) end
-							-- the cast can take a moment to show in last_active_cast; until then the next turn reads as due
-							task.wait(1)
-							pendingBuff[id] = nil
-						end)
-					end
-				end
+			end)
+			if not ok then
+				Collection:Elevate()
+				UpgradeStatus:SetDesc("Error: " .. tostring(problem))
 			end
 		end
 	end)
