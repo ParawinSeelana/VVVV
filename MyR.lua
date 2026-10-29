@@ -63,8 +63,9 @@ local State = {
 	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeUntil = 13, UpgradePriority = {}, UpgradeOrder = "Cheapest first",
 	UpgradeCaps = {}, -- unit name -> stop at this upgrade
-	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20, EndAction = "Nothing",
-	LobbyAtWave = false, LobbyWave = 30,
+	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20,
+	AutoLobby = false, AutoRetry = false, AutoNext = false, AutoNextPortal = false,
+	LobbyAtWave = false, LobbyWave = 30, LobbyFallback = false, LobbyFallbackWait = 15,
 	-- auto play
 	AutoPlace = false, ShowPlacePoint = true, ShowHolograms = true, PlaceBeforeUpgrade = true, FarmsFirst = false, ShowSpots = false,
 	PlaceDistance = 50, FarmPlaceDistance = 50,
@@ -79,7 +80,7 @@ local State = {
 	AutoDaily = false, AutoBattlePass = false, AutoQuests = false, AutoMissions = false, AutoLevelRewards = false,
 	Codes = "",
 	-- misc
-	LowGraphics = false, HideName = false, WebhookUrl = "", WebhookSend = { ["Match results"] = true, ["Rare summons"] = true, ["Reroll hits"] = true },
+	LowGraphics = false, FPSCap = 30, HideName = false, WebhookUrl = "", WebhookSend = { ["Match results"] = true, ["Rare summons"] = true, ["Reroll hits"] = true },
 }
 ---------------------------------------------- [ Prepare Project ] ----------------------------------------------
 
@@ -451,6 +452,8 @@ function VaderUI:Destroy()
 	pcall(Collection.ShowEnemies, Collection)
 	State.DeleteMap = false
 	pcall(Collection.ApplyDeleteMap, Collection)
+	State.BoostFPS = false
+	if State.WhiteScreen then pcall(Services.RunService.Set3dRenderingEnabled, Services.RunService, true) end
 	State.Join, State.AutoSummon, State.PlayMacro, State.AutoUpgrade = {}, false, false, false
 	if Client.EndpointsClient.invoke_server == Collection.RecordingInvoke then Client.EndpointsClient.invoke_server = originalInvoke end
 	for _, connection in ipairs(Connections) do
@@ -1168,11 +1171,57 @@ MatchSection:AddToggle("AutoSkip", {
 	Title = "Auto Skip Waves", Default = false,
 	Callback = function(value) State.AutoSkip = value end,
 })
-MatchSection:AddDropdown("EndAction", {
-	Title = "When Match Ends", Values = { "Nothing", "Replay", "Next Stage", "Lobby" }, Default = "Nothing", Multi = false,
-	Description = "Next Stage = Replay outside story.",
-	Callback = function(value) State.EndAction = value end,
+MatchSection:AddToggle("AutoNextPortal", {
+	Title = "Auto Next Portal", Default = false,
+	Description = "Portals, host only. A picked portal first, else any that fits.",
+	Callback = function(value) State.AutoNextPortal = value end,
 })
+MatchSection:AddToggle("AutoNext", {
+	Title = "Auto Next", Default = false,
+	Description = "Story wins: the next stage.",
+	Callback = function(value) State.AutoNext = value end,
+})
+MatchSection:AddToggle("AutoRetry", {
+	Title = "Auto Retry", Default = false,
+	Callback = function(value) State.AutoRetry = value end,
+})
+MatchSection:AddToggle("AutoLobby", {
+	Title = "Auto Return To Lobby", Default = false,
+	Description = "When none of the above applies.",
+	Callback = function(value) State.AutoLobby = value end,
+})
+
+-- a portal in your inventory the results screen's Pick Next Portal takes: a picked one (Portals) first, else any
+function Collection:ReplayPortal()
+	local any
+	for _, it in session.inventory.inventory_profile_data.unique_items do
+		local ok, valid = pcall(function() return Core.LevelServiceCore.is_valid_replay_portal_item(session, it.uuid) end)
+		if ok and valid then
+			local item = Data.Items[it.item_id]
+			if item and State.Portals[item.name] then return it.uuid end
+			any = any or it.uuid
+		end
+	end
+	return any
+end
+-- what the results screen does next, the first that applies, by the game's own button rules: Next Portal (the host
+-- on a portal), Next (a story win with a next stage), Retry (not on a portal), Return To Lobby. Its label and the call
+function Collection:EndAction(victory)
+	local level = Loader.LevelData
+	if level._is_map_or_portal_level then
+		local portal = State.AutoNextPortal and level._owner_player_userid == LP.UserId and Collection:ReplayPortal()
+		if portal then
+			return "Next portal", function() Collection:Invoke("set_game_finished_vote", "replay", { item_uuid = portal }) end
+		end
+	-- can't read the stage order: try Next anyway, like the old build did
+	elseif State.AutoNext and victory and level._is_actual_storymode
+		and select(2, pcall(function() return Core.ProgressionServiceCore.get_next_story_level(level.id) end)) then
+		return "Next stage", function() Collection:Invoke("set_game_finished_vote", "next_story") end
+	elseif State.AutoRetry then
+		return "Retry", function() Collection:Invoke("set_game_finished_vote", "replay") end
+	end
+	if State.AutoLobby then return "Back to the lobby", function() Collection:Invoke("teleport_back_to_lobby") end end
+end
 
 local SellSection = Tabs.Match:AddSection("Sell")
 SellSection:AddToggle("AutoSell", {
@@ -1193,6 +1242,15 @@ LeaveSection:AddToggle("LobbyAtWave", {
 LeaveSection:AddSlider("LobbyWave", {
 	Title = "Lobby At Wave", Default = 30, Min = 1, Max = 200, Rounding = 0,
 	Callback = function(value) State.LobbyWave = value end,
+})
+LeaveSection:AddToggle("LobbyFallback", {
+	Title = "Lobby Fallback", Default = false,
+	Description = "Stuck on the Victory/Defeat screen: teleports to the lobby.",
+	Callback = function(value) State.LobbyFallback = value end,
+})
+LeaveSection:AddSlider("LobbyFallbackWait", {
+	Title = "Fallback After (seconds)", Default = 15, Min = 10, Max = 60, Rounding = 0,
+	Callback = function(value) State.LobbyFallbackWait = value end,
 })
 
 --------------------------- [[ Auto Play Tab ]] ---------------------------
@@ -2133,6 +2191,110 @@ Performance:AddToggle("DeleteMap", {
 		end)
 	end,
 })
+
+-- strips everything that glows or costs frames: lighting effects, sky, shadows, water, particles, lights, decals and
+-- textures, and anything that spawns later; lowest saved quality level. The hub's own markers (workspace.Vader*) keep their looks
+function Collection:BoostInstance(inst)
+	local top = inst
+	while top.Parent and top.Parent ~= workspace do top = top.Parent end
+	if top.Name:find("^Vader") then return end
+	if inst:IsA("BasePart") then
+		inst.CastShadow = false
+		inst.Material = Enum.Material.SmoothPlastic
+		inst.Reflectance = 0
+		if inst:IsA("MeshPart") then
+			inst.RenderFidelity = Enum.RenderFidelity.Performance
+			inst.CollisionFidelity = Enum.CollisionFidelity.Box
+		end
+	end
+	if inst:IsA("Highlight") or inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Smoke")
+		or inst:IsA("Fire") or inst:IsA("Sparkles") or inst:IsA("Explosion") or inst:IsA("Clouds")
+		or inst:IsA("Decal") or inst:IsA("Texture") or inst:IsA("ShirtGraphic") then
+		inst:Destroy()
+	elseif inst:IsA("Light") then
+		inst.Enabled = false
+	end
+end
+function Collection:BoostFPS()
+	local Lighting = Services.Lighting
+	pcall(function()
+		Lighting.GlobalShadows = false
+		Lighting.FogEnd = 9e9
+		Lighting.Technology = Enum.Technology.Compatibility
+		Lighting.EnvironmentSpecularScale = 0
+		Lighting.EnvironmentDiffuseScale = 0
+		Lighting.Brightness = 1
+		Lighting.ClockTime = 14
+		for _, v in Lighting:GetChildren() do
+			if v:IsA("PostEffect") or v:IsA("Atmosphere") or v:IsA("Sky") or v:IsA("Clouds") then v:Destroy() end
+		end
+		local sky = Instance.new("Sky")
+		sky.SunTextureId, sky.MoonTextureId, sky.StarCount = "", "", 0
+		for _, face in { "Bk", "Dn", "Ft", "Lf", "Rt", "Up" } do sky["Skybox" .. face] = "rbxassetid://0" end
+		sky.Parent = Lighting
+	end)
+	pcall(function()
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		terrain.WaterWaveSize, terrain.WaterWaveSpeed, terrain.WaterReflectance, terrain.WaterTransparency = 0, 0, 0, 0
+		terrain.Decoration = false
+	end)
+	for _, v in workspace:GetDescendants() do pcall(Collection.BoostInstance, Collection, v) end
+	-- deferred so whatever made it (the game, or the hub naming its markers) finishes setting it up first
+	Collection.BoostConnection = Collection.BoostConnection or Collection:Track(workspace.DescendantAdded:Connect(function(v)
+		if State.BoostFPS then task.defer(pcall, Collection.BoostInstance, Collection, v) end
+	end))
+	pcall(function() UserSettings().GameSettings.SavedQualityLevel = Enum.SavedQualityLevel.Level1 end)
+end
+Performance:AddToggle("BoostFPS", {
+	Title = "Boost FPS", Default = false,
+	Description = "Matches only. Strips lighting, shadows, glow, particles, decals and textures. Rejoin to undo.",
+	Callback = function(value)
+		State.BoostFPS = value
+		if not value or IS_LOBBY then return end -- the lobby keeps its looks
+		task.spawn(function()
+			repeat task.wait(1) until closed or workspace._MAP_CONFIG.MapLoaded.Value
+			if not closed and State.BoostFPS then Collection:BoostFPS() end
+		end)
+	end,
+})
+Performance:AddToggle("WhiteScreen", {
+	Title = "White Screen (more FPS)", Default = false,
+	Description = "Stops 3D rendering. The hub still works.",
+	Callback = function(value)
+		-- Ignore the initial "off" so nothing else's rendering setting is touched.
+		if not value and not State.WhiteScreen then return end
+		State.WhiteScreen = value
+		pcall(Services.RunService.Set3dRenderingEnabled, Services.RunService, not value)
+	end,
+})
+-- off = Roblox's own 60
+function Collection:ApplyFPSCap()
+	if setfpscap then pcall(setfpscap, State.FPSLock and State.FPSCap or 60) end
+end
+Performance:AddToggle("FPSLock", {
+	Title = "FPS Cap", Default = false,
+	Description = "Caps your FPS at FPS Cap Value.",
+	Callback = function(value)
+		-- Ignore the initial "off" so the player's own FPS unlocker is left alone.
+		if not value and not State.FPSLock then return end
+		State.FPSLock = value
+		Collection:ApplyFPSCap()
+	end,
+})
+Performance:AddSlider("FPSCap", {
+	Title = "FPS Cap Value", Default = 30, Min = 5, Max = 240, Rounding = 0,
+	Callback = function(value)
+		State.FPSCap = value
+		if State.FPSLock then Collection:ApplyFPSCap() end
+	end,
+})
+-- Roblox puts its own cap back now and then (window focus, menus, settings), so keep re-applying ours
+task.spawn(function()
+	while not closed do
+		if State.FPSLock then Collection:ApplyFPSCap() end
+		task.wait(1)
+	end
+end)
 
 local Privacy = Tabs.Misc:AddSection("Privacy")
 local HIDE_FRAMES = { "Name_Frame", "Level_Frame", "Guild_Frame" }
@@ -3221,14 +3383,32 @@ if not IS_LOBBY then task.spawn(function()
 				end
 				return
 			end
-			local action = State.EndAction
-			if action == "Nothing" or not Collection:TeleportDelay(action, function() return State.EndAction == action end) then return end
-			if action == "Replay" then
-				Collection:Invoke("set_game_finished_vote", "replay")
-			elseif action == "Next Stage" then
-				Collection:Invoke("set_game_finished_vote", Loader.LevelData._is_actual_storymode and "next_story" or "replay")
-			elseif action == "Lobby" then
-				Collection:Invoke("teleport_back_to_lobby")
+			local action, vote = Collection:EndAction(results.victory)
+			if not action or not Collection:TeleportDelay(action, function() return (Collection:EndAction(results.victory)) == action end) then return end
+			vote()
+		end)
+		-- Lobby Fallback: every way on from the results screen leaves this server, so still being here Fallback After
+		-- seconds past the Auto Next/Retry/Lobby turn means the vote or teleport never went through. The game's Lobby button first, then a
+		-- plain Roblox teleport to the lobby, again each wait. Only while the results screen (ResultsUI) is up, and only for the
+		-- latest match end; the dungeon loop picks its own room
+		local matchEnd = {}
+		Collection.MatchEnd = matchEnd
+		task.spawn(function()
+			local due, tries = os.clock() + 3 + State.TeleportDelay + State.LobbyFallbackWait, 0
+			while not closed and Collection.MatchEnd == matchEnd do
+				task.wait(1)
+				local results = LP.PlayerGui:FindFirstChild("ResultsUI")
+				if State.LobbyFallback and os.clock() >= due and results and results.Enabled
+					and not (Loader.LevelData._dungeon and State.AutoDungeon) then
+					tries += 1
+					Collection:Notify("Stuck after the match - back to the lobby")
+					if tries == 1 then
+						task.spawn(Collection.Invoke, Collection, "teleport_back_to_lobby") -- a stuck server never answers
+					else
+						pcall(function() Services.TeleportService:Teleport(8304191830, LP) end) -- the lobby place
+					end
+					due = os.clock() + State.LobbyFallbackWait
+				end
 			end
 		end)
 	end))
@@ -3952,6 +4132,12 @@ end
 -- many were applied
 function Collection:ApplyOptions(options, only)
 	local pending = {}
+	-- older builds had one "When Match Ends" dropdown (EndAction); its pick turns into the toggles that replaced it
+	local oldEnd = type(options.EndAction) == "table"
+		and ({ Replay = { "AutoRetry" }, ["Next Stage"] = { "AutoNext", "AutoRetry" }, Lobby = { "AutoLobby" } })[options.EndAction.Value]
+	if oldEnd and options.AutoLobby == nil and options.AutoRetry == nil and options.AutoNext == nil then
+		for _, id in oldEnd do options[id] = { Type = "Toggle", Value = true } end
+	end
 	-- Validate every known value before applying any callbacks.
 	for id, saved in pairs(options) do
 		local option = VaderUI.Options[id]
