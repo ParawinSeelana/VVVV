@@ -591,11 +591,26 @@ local PALETTE = {
 }
 local priorityLists = {} -- render functions, re-run when the theme changes
 
+-- what sharing the whole config never carries, out or in: your webhook, party and hide key, the text boxes, and what
+-- spends, sells or uses up portals the moment it's on (KeepGems: someone else's reserve would let Auto Summon spend more)
+local SHARE_SKIP = {
+	WebhookUrl = true, PartyMode = true, PartyHost = true, MinimizeKey = true, Codes = true, MacroLink = true, MacroNewName = true,
+	ConfigShare = true, CardShare = true, DungeonShare = true, AutoSummon = true, KeepGems = true, AutoSellRarities = true,
+	AutoEventShop = true, AutoMadokaShop = true, AutoPortal = true, AutoNextPortal = true,
+}
+
 -- A box plus Import / Export buttons for these controls. Export copies them in the config file's format, so a whole
--- config pasted into the box imports too (only these controls are taken from it).
+-- config pasted into the box imports too (only these controls are taken from it). No ids: the whole config but
+-- SHARE_SKIP, with the Position Manager's spots, which My position needs
 function Collection:AddShare(section, id, label, ids)
-	local only = {}
-	for _, k in ids do only[k] = true end
+	local function shared()
+		if ids then return ids end
+		local all = {}
+		for k in VaderUI.Options do
+			if not SHARE_SKIP[k] then table.insert(all, k) end
+		end
+		return all
+	end
 	section:AddInput(id, { Title = label .. " JSON", Placeholder = "Paste what Export copied", Default = "", Finished = false })
 	section:AddButton({
 		Title = "Import " .. label,
@@ -603,7 +618,18 @@ function Collection:AddShare(section, id, label, ids)
 			local ok, problem = pcall(function()
 				local data = HttpService:JSONDecode(VaderUI.Options[id].Value)
 				assert(type(data) == "table" and type(data.Options) == "table", "That isn't an export.")
+				local only = {}
+				for _, k in shared() do only[k] = true end
 				assert(Collection:ApplyOptions(data.Options, only) > 0, "Nothing for " .. label .. " in it.")
+				if not ids then
+					for key, spot in type(data.Positions) == "table" and data.Positions or {} do
+						if type(spot) == "table" and type(spot[1]) == "number" and type(spot[2]) == "number" and type(spot[3]) == "number" then
+							placePositions[key] = spot
+						end
+					end
+					Collection:WriteJson(placePositionsPath, placePositions)
+					VaderUI.Options[id]:SetValue("") -- that much JSON doesn't belong in the saved config
+				end
 			end)
 			Collection:Notify(ok and ("Imported " .. label .. ".") or ("Import failed: " .. tostring(problem):gsub("^.-:%d+: ", "")))
 		end,
@@ -613,7 +639,13 @@ function Collection:AddShare(section, id, label, ids)
 		Description = "Copies JSON to clipboard.",
 		Callback = function()
 			local all, out = Collection:Snapshot().Options, { Version = 1, Options = {} }
-			for _, k in ids do out.Options[k] = all[k] end
+			for _, k in shared() do out.Options[k] = all[k] end
+			if not ids then
+				out.Positions = {}
+				for key, spot in placePositions do
+					if type(spot) == "table" then out.Positions[key] = spot end -- locks (true) stay yours
+				end
+			end
 			local copy = setclipboard or toclipboard or (Clipboard and Clipboard.set)
 			if type(copy) ~= "function" or not pcall(copy, HttpService:JSONEncode(out)) then
 				return Collection:Notify("Couldn't copy to the clipboard.")
@@ -1220,7 +1252,15 @@ function Collection:EndAction(victory)
 	elseif State.AutoRetry then
 		return "Retry", function() Collection:Invoke("set_game_finished_vote", "replay") end
 	end
-	if State.AutoLobby then return "Back to the lobby", function() Collection:Invoke("teleport_back_to_lobby") end end
+	if State.AutoLobby then
+		return "Back to the lobby", function()
+			-- a dropped or unanswered call leaves you on the results screen: ask again until the teleport happens
+			while not closed and State.AutoLobby do
+				task.spawn(Collection.Invoke, Collection, "teleport_back_to_lobby") -- a stuck server never answers
+				task.wait(10)
+			end
+		end
+	end
 end
 
 local SellSection = Tabs.Match:AddSection("Sell")
@@ -2612,7 +2652,7 @@ end
 
 local dungeonTurn = false -- Join Priority reached Dungeon Run: the dungeon loop may start a run / enter a room from the lobby
 if IS_LOBBY then
-	Collection:RefreshChallenge()
+	task.spawn(Collection.RefreshChallenge, Collection) -- a stuck server never answers: the config still has to load below
 	Collection:Track(fromServer.normal_challenge_remaining_time_changed.OnClientEvent:Connect(function(seconds)
 		if type(seconds) == "number" then
 			challengeInfo.ends_at = os.time() + seconds
@@ -3321,15 +3361,17 @@ if not IS_LOBBY then task.spawn(function()
 	while not Loader.LevelData and not closed do task.wait(0.5) end
 	if closed then return end
 	local matchStart = os.time()
-	local startChallenge = (Collection:RefreshChallenge() or {}).current_uuid
-	local gameStarted = workspace._DATA.GameStarted
+	-- in its own thread: a server that never answers mustn't hold up everything below (skip, start vote, match end)
+	local startChallenge
+	task.spawn(function() startChallenge = (Collection:RefreshChallenge() or {}).current_uuid end)
+	local gameStarted = workspace:WaitForChild("_DATA"):WaitForChild("GameStarted")
 	local soldThisMatch, leaving = false, false
 
 	Collection:Track(fromServer.start_vote_wave_skip.OnClientEvent:Connect(function()
 		if State.AutoSkip then Collection:Invoke("vote_wave_skip") end
 	end))
 
-	Collection:Track(workspace._wave_num.Changed:Connect(function(wave)
+	Collection:Track(workspace:WaitForChild("_wave_num").Changed:Connect(function(wave)
 		MatchStatus:SetDesc("Wave " .. tostring(wave) .. "  |  Money " .. tostring(Collection:Money()))
 		if State.AutoSell and not soldThisMatch and wave >= State.SellWave then
 			soldThisMatch = true
@@ -3348,21 +3390,26 @@ if not IS_LOBBY then task.spawn(function()
 		end
 	end))
 
-	Collection:Track(fromServer.game_finished.OnClientEvent:Connect(function(results)
+	local endHandled = false -- this results screen's match end has run
+	local function onMatchEnd(results)
+		endHandled = true
 		dungeonMatchOver = true
 		results = type(results) == "table" and results or {}
 		local stats = type(results.stats) == "table" and results.stats or {}
 		local secs = math.ceil(tonumber(stats.time_taken) or 0)
-		Collection:Webhook("Match results", (results.victory and "Victory" or "Defeat") .. " !", {
-			"Total Gem : " .. Collection:Comma(Collection:Gems()),
-			"Total XP : " .. Collection:Comma(LP._stats.player_xp.Value),
-			"",
-			"Map : " .. tostring(results.title or Loader.LevelData.name or Loader.LevelData.id),
-			"Wave : " .. tostring(stats.waves_completed or workspace._wave_num.Value),
-			"Total Time : " .. string.format("%02d:%02d", secs // 60, secs % 60),
-			"Gem Earn : " .. Collection:Comma(results.gem_reward),
-			"XP Earn : " .. Collection:Comma(results.xp_reward),
-		})
+		-- in its own thread: a line that errors here must not cost the Auto Next/Retry/Lobby turn below
+		task.spawn(function()
+			Collection:Webhook("Match results", (results.victory and "Victory" or "Defeat") .. " !", {
+				"Total Gem : " .. Collection:Comma(Collection:Gems()),
+				"Total XP : " .. Collection:Comma(LP._stats.player_xp.Value),
+				"",
+				"Map : " .. tostring(results.title or Loader.LevelData.name or Loader.LevelData.id),
+				"Wave : " .. tostring(stats.waves_completed or workspace._wave_num.Value),
+				"Total Time : " .. string.format("%02d:%02d", secs // 60, secs % 60),
+				"Gem Earn : " .. Collection:Comma(results.gem_reward),
+				"XP Earn : " .. Collection:Comma(results.xp_reward),
+			})
+		end)
 		task.delay(3, function()
 			if closed then return end
 			if Loader.LevelData._dungeon and State.AutoDungeon then return end -- the dungeon loop takes it from here
@@ -3411,7 +3458,22 @@ if not IS_LOBBY then task.spawn(function()
 				end
 			end
 		end)
-	end))
+	end
+	Collection:Track(fromServer.game_finished.OnClientEvent:Connect(onMatchEnd))
+	-- game_finished only reaches a listener that's already connected, but the results screen stays up: a match end the
+	-- event didn't bring (hub loaded or reloaded around it) is still picked up from there
+	task.spawn(function()
+		local wasUp = false
+		while not closed do
+			task.wait(1)
+			local screen = LP.PlayerGui:FindFirstChild("ResultsUI")
+			local up = screen ~= nil and screen.Enabled
+			if wasUp and not up then endHandled = false end
+			wasUp = up
+			local ui = Client.GUIService.results_ui
+			if up and not endHandled and ui and ui.settings then onMatchEnd(ui.settings) end
+		end
+	end)
 
 	-- event cards: vote as soon as they're offered
 	Collection:Track(fromServer.show_roguelike_options.OnClientEvent:Connect(function(_, options)
@@ -3437,7 +3499,7 @@ if not IS_LOBBY then task.spawn(function()
 				elseif os.clock() - lastVote > 10 then
 					lastVote = os.clock()
 					MatchStatus:SetDesc("Voted to start")
-					Collection:Invoke("vote_start")
+					task.spawn(Collection.Invoke, Collection, "vote_start") -- unanswered, it must not stop the next vote
 				end
 			end
 			task.wait(1)
@@ -3975,6 +4037,7 @@ end)
 -- lobby only
 task.spawn(function()
 	local spent, pulls, best = 0, 0, {}
+	local refused = 0 -- rounds the server turned down in a row
 	while not closed do
 		task.wait(1)
 		if State.AutoSummon then
@@ -3998,20 +4061,27 @@ task.spawn(function()
 				elseif count + n > capacity then
 					stop("Unit storage is full (" .. count .. "/" .. capacity .. ").")
 				else
-					-- two summons at once when gems and storage cover both: their reveals overlap, 20 a round on x10
-					local calls = (Collection:Gems() - cost * 2 >= State.KeepGems and count + n * 2 <= capacity) and 2 or 1
+					-- one summon a round, like the game's button
 					local beforeGems, before = Collection:Gems(), {}
 					for uuid in Collection:Owned() do before[uuid] = true end
-					for _ = 1, calls do task.spawn(Collection.Invoke, Collection, "buy_from_banner", State.Banner, payArg) end
+					task.spawn(Collection.Invoke, Collection, "buy_from_banner", State.Banner, payArg)
 					local t0, got = os.clock(), 0
 					repeat
 						task.wait(0.25)
 						got = 0
 						for uuid in Collection:Owned() do if not before[uuid] then got += 1 end end
-					until got >= n * calls or os.clock() - t0 > 8 or closed
+					until got >= n or os.clock() - t0 > 8 or closed
 					if got == 0 and Collection:Gems() == beforeGems then
-						stop("Summon didn't go through (banner currency, storage or cooldown).")
+						refused += 1
+						if refused >= 5 then
+							stop("Summon didn't go through (banner currency, storage or cooldown).")
+						else
+							-- a rate limit clears by itself: wait it out instead of turning Auto Summon off
+							SummonStatus:SetDesc(string.format("Summon refused - trying again in %ds (%d/5)", refused * 5, refused))
+							task.wait(refused * 5)
+						end
 					else
+						refused = 0
 						pulls += got
 						spent += math.max(beforeGems - Collection:Gems(), 0)
 						for uuid, u in Collection:Owned() do
@@ -4086,6 +4156,7 @@ local minimizeKey = Settings:AddKeybind("MinimizeKey", {
 })
 VaderUI.MinimizeKeybind = minimizeKey
 Settings:AddButton({ Title = "Unload UI", Callback = function() VaderUI:Destroy() end })
+Collection:AddShare(Tabs.Settings:AddSection("Share Config"), "ConfigShare", "Config")
 
 local antiAFK = true
 local autoSave = true
