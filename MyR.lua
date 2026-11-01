@@ -48,7 +48,7 @@ local State = {
 	AutoMansion = false, MansionDifficulty = "Normal",
 	AutoPortal = false, Portals = {},
 	-- event
-	AutoJoinEvent = false, EventJoinBy = "Normal", AutoPickCards = false, CardPriority = {},
+	AutoJoinEvent = false, EventJoinBy = "Normal", SkipWeather = {}, AutoPickCards = false, CardPriority = {},
 	AutoDiscard = false, DiscardSpells = {}, AutoSpells = false, UseSpells = {}, AutoKeepUnits = false, KeepMode = "Keep", KeepUnits = {}, UpgradeOnlyKept = false,
 	AutoContract = false, ContractJoinBy = "Normal", ContractWeakTo = { Physical = true, Magic = true }, ContractTierMode = "Highest tier",
 	ContractMaxTier = 10, SkipCompletedContracts = true,
@@ -914,16 +914,39 @@ end
 
 local eventNote, contractPreview = "Idle", "Next contract: checking..."
 local EventStatus = Tabs.Event:AddParagraph({ Title = "Status", Content = "-" })
+-- Summer Hunt's hourly map and weather, with the forecast of the next ones ("???" while the game hides them)
+function Collection:Hunt()
+	local all = Client.ChallengeServiceClient._CURRENT_EVENT_CHALLENGES
+	return type(all) == "table" and type(all.summer2_event) == "table" and all.summer2_event or nil
+end
+function Collection:WeatherName(id)
+	local w = id and Data.Weather[id]
+	return w and w.name or nil
+end
+function Collection:MapName(id)
+	local ok, m = pcall(function() return Data.Maps[id] end)
+	return ok and m and m.name or id
+end
 function Collection:RefreshEventStatus()
 	local res = Data.GameplaySettings.CURRENT_EVENT_RESOURCE
-	EventStatus:SetDesc(string.format("%s: %d\n%s\n%s", tostring(res), Collection:EventResource(res), contractPreview, eventNote))
+	local text = string.format("%s: %d", tostring(res), Collection:EventResource(res))
+	local hunt = Collection:Hunt()
+	if hunt then
+		local now = hunt.current_level_data and hunt.current_level_data.map
+		local coming = type(hunt.forecast) == "table" and hunt.forecast or {}
+		text ..= string.format("\nNow: %s - %s\nNext: %s - %s", tostring(Collection:MapName(now) or "?"),
+			Collection:WeatherName(hunt.current_weather) or "?",
+			coming.map and Collection:MapName(coming.map) or coming.map_hint or "???",
+			coming.weather and Collection:WeatherName(coming.weather) or coming.weather_hint or "???")
+	end
+	EventStatus:SetDesc(text .. "\n" .. contractPreview .. "\n" .. eventNote)
 end
 Collection:RefreshEventStatus()
 
 local EventStageSection = Tabs.Event:AddSection("Event Stage")
 EventStageSection:AddToggle("AutoJoinEvent", {
 	Title = "Auto Join", Default = false,
-	Description = "Joins the event stage.",
+	Description = "Joins the event pad's stage (Summer Hunt).",
 	Callback = function(value) State.AutoJoinEvent = value end,
 })
 EventStageSection:AddDropdown("EventJoinBy", {
@@ -931,6 +954,18 @@ EventStageSection:AddDropdown("EventJoinBy", {
 	Description = "Normal = solo. Matchmaking = queue.",
 	Callback = function(value) State.EventJoinBy = value end,
 })
+do
+	local names = {}
+	for _, w in Data.Weather do
+		if type(w) == "table" and w.name and not table.find(names, w.name) then table.insert(names, w.name) end
+	end
+	table.sort(names)
+	EventStageSection:AddDropdown("SkipWeather", {
+		Title = "Skip Weather", Values = names, Multi = true, Default = {},
+		Description = "Summer Hunt: don't join while the hour's weather is one of these. Pick all but one = only that one.",
+		Callback = function(value) State.SkipWeather = value end,
+	})
+end
 
 -- ids are what Collection:CardKind gives a card; the game only reveals cards when it offers them, so kinds, not titles
 local CardSection = Tabs.Event:AddSection("Event Cards")
@@ -2496,8 +2531,16 @@ function Collection:JoinEvent()
 	end
 	if not level then return nil, "Event: no event pad in this lobby." end
 	local name = Data.Levels[level] and Data.Levels[level].name or level
+	local hunt = level == "summer2_event" and Collection:Hunt()
+	local weather = hunt and Collection:WeatherName(hunt.current_weather)
+	if weather and State.SkipWeather[weather] then return nil, "Event: skipping " .. weather .. " (Skip Weather)." end
 	if State.EventJoinBy == "Matchmaking" then
 		return Collection:Matchmake(level, "Event", name, function() return State.AutoJoinEvent end)
+	end
+	-- Summer Hunt's pad opens a portal lobby of your own; Hard, what the game's prompt sent when played by hand
+	if level == "summer2_event" then
+		return Collection:StartPortal("Event", name, function() return State.AutoJoinEvent end,
+			function() return Collection:Invoke("open_event_portal", level, { difficulty = "Hard" }) end)
 	end
 	local pad = Collection:FreePad(folder)
 	if not pad then return nil, "Event: no free pad." end
