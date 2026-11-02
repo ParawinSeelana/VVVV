@@ -2148,9 +2148,19 @@ Tabs.Traits:AddButton({
 
 local ClaimSection = Tabs.Rewards:AddSection("Auto Claim")
 local RewardStatus = ClaimSection:AddParagraph({ Title = "Status", Content = "Checks every minute." })
-for _, paragraph in { JoinStatus, EventStatus, DungeonStatus, MatchStatus, PlaceStatus, MacroStatus, AssignList, SummonStatus, TraitStatus, StatStatus, RewardStatus } do
+-- a status write can follow game code, which strips the UI permission until the thread yields. Elevate puts it back
+-- where the executor can; where it can't, the write waits one frame for the strip to end. A write never throws, so a
+-- loop can't die on its status line (Auto Upgrade's error report wasn't wrapped)
+for _, paragraph in { JoinStatus, EventStatus, DungeonStatus, MatchStatus, PlaceStatus, UpgradeStatus, MacroStatus, AssignList,
+	SummonStatus, TraitStatus, StatStatus, RewardStatus } do
 	local setDesc = paragraph.SetDesc
-	function paragraph:SetDesc(text) Collection:Elevate() return setDesc(self, text) end
+	function paragraph:SetDesc(text)
+		Collection:Elevate()
+		if not pcall(setDesc, self, text) then
+			task.wait()
+			pcall(setDesc, self, text)
+		end
+	end
 end
 ClaimSection:AddToggle("AutoDaily", {
 	Title = "Daily Reward", Default = false,
@@ -2888,7 +2898,22 @@ function Collection:PathDistance(points, x, z)
 	return math.sqrt(best)
 end
 
--- the game lifts a placement by half the unit model's height. Read from the stored template: building a model
+-- how many more copies of a unit the game takes, from its own unit bar count (UnitsSpawnUI.get_placement_counts):
+-- a unique-trait unit stops at 1 and evolved forms share one count, which Data spawn_cap doesn't know. nil when the
+-- bar isn't up
+function Collection:PlacementRoom(uuid)
+	local bar = Client.GUIService.units_spawn_ui
+	local unit = bar and Client.UnitCollectionServiceClient.get_equipped_unit_by_uuid(uuid)
+	if not unit then return nil end
+	local ok, placed, cap, _, atCap = pcall(bar.get_placement_counts, bar, unit)
+	Collection:Elevate()
+	if not ok or type(placed) ~= "number" then return nil end
+	return atCap and 0 or math.max(cap - placed, 0)
+end
+
+-- half the unit model's height, to stand holograms on the ground. Placements go at the ground point, like the game's
+-- own: the server lifts the unit itself and refuses a spot sent 1 stud up (C.E.O. has no plain template, so this fell
+-- back to 1 and every C.E.O. was refused). Read from the stored template: building a model
 -- with get_unit_model runs the unit's setup script on this thread, which strips the executor's permissions.
 local unitHalfHeight = {}
 function Collection:UnitHalfHeight(unitId)
@@ -3201,7 +3226,9 @@ if not IS_LOBBY then task.spawn(function()
 				if data and cfg.On then
 					-- Fool's Hunt has no per-unit cap (a unique places as often as any), only the 20-unit event limit
 					local unitCap = (Loader.LevelData or {}).id ~= "april2_event" and data.spawn_cap or nil
-					local count, cap = placed[uuid] or 0, math.min(cfg.Max, unitCap or cfg.Max)
+					-- the game's own count when its unit bar is up (unique trait = 1, evolved forms share), else spawn_cap
+					local count = placed[uuid] or 0
+					local cap = math.min(cfg.Max, count + (Collection:PlacementRoom(uuid) or (unitCap or cfg.Max) - count))
 					local farm = Collection:IsFarm(u.unit_id)
 					table.insert(lines, string.format("%s %s%s: %d/%d%s", slot, Collection:UnitName(u), Collection:PlacementTag(data), count, cap,
 						anchor and (" at " .. where) or (" - " .. where)))
@@ -3248,8 +3275,7 @@ if not IS_LOBBY then task.spawn(function()
 						note = pick.data.hill_unit and ("No free hill spot for " .. name .. " - skipping it.")
 							or ("No free spot for " .. name .. " within 30 studs of its point - skipping it.")
 					else
-						local pos = spot + Vector3.new(0, Collection:UnitHalfHeight(pick.u.unit_id), 0)
-						if Collection:Invoke("spawn_unit", pick.uuid, CFrame.lookAt(pos, Vector3.new(pick.anchor.X, pos.Y, pick.anchor.Z))) then
+						if Collection:Invoke("spawn_unit", pick.uuid, CFrame.lookAt(spot, Vector3.new(pick.anchor.X, spot.Y, pick.anchor.Z))) then
 							refusals[pick.uuid] = 0
 							note = string.format("Placed %s #%d", name, pick.count + 1)
 						else
@@ -3574,8 +3600,7 @@ if not IS_LOBBY then task.spawn(function()
 					local path = cfg.Mode == "Enemy path"
 					local spot, key = Collection:FindSpot(Data.Units[unitId], anchor, bad, nil, path and 100 or nil, path)
 					if not spot then return nil end
-					local pos = spot + Vector3.new(0, Collection:UnitHalfHeight(unitId), 0)
-					return CFrame.lookAt(pos, Vector3.new(anchor.X, pos.Y, anchor.Z)), key
+					return CFrame.lookAt(spot, Vector3.new(anchor.X, spot.Y, anchor.Z)), key
 				end
 			end
 		end
@@ -3651,7 +3676,13 @@ if not IS_LOBBY then task.spawn(function()
 					else
 						local cf, key
 						if State.MacroSlotSpots then cf, key = slotPlacement(uuid, step.unit_id) end
-						cf = cf or CFrame.new(table.unpack(step.cf))
+						if not cf then
+							-- sent on the ground like the game's own placement (Auto Place recordings sit up to 1 stud above it)
+							cf = CFrame.new(table.unpack(step.cf))
+							placeRay.FilterDescendantsInstances = { workspace:FindFirstChild("_terrain") }
+							local ground = workspace:Raycast(cf.Position + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), placeRay)
+							if ground then cf = cf.Rotation + ground.Position end
+						end
 						if Collection:Invoke("spawn_unit", uuid, cf) then
 							models[i] = spawnedModel(uuid, cf.Position)
 							homes[i] = models[i] and { uuid = uuid, pos = models[i]:GetPivot().Position }
@@ -4077,6 +4108,21 @@ end)
 
 --------------------------- [[ Summon ]] ---------------------------
 
+-- what a pull on banner id costs, in what: (how much you have, price of one pull, currency). A gem_cost is Gems; a
+-- resource_cost is the banner's own currency (Legacy: GemsLegacy, Summer2026: SummerPearls), and x1 / x10 buy with it
+-- too. The price goes through the game's calculate_hatch_price (VIP takes 20% off Gems and Legacy Gems)
+function Collection:BannerCurrency(id)
+	local b = Data.Banners[id] or {}
+	local currency, price, have = "Gems", b.gem_cost or 50, Collection:Gems()
+	if type(b.resource_cost) == "table" then
+		currency, price = b.resource_cost.id, b.resource_cost.amount
+		local stat = LP._stats:FindFirstChild("_resource" .. currency)
+		have = stat and stat.Value or 0
+	end
+	local ok, discounted = pcall(Core.SummonServiceCore.calculate_hatch_price, session, price, currency == "Gems" and "gems" or currency)
+	return have, ok and tonumber(discounted) or price, currency
+end
+
 -- lobby only
 task.spawn(function()
 	local spent, pulls, best = 0, 0, {}
@@ -4086,7 +4132,7 @@ task.spawn(function()
 		if State.AutoSummon then
 			local function stop(msg)
 				VaderUI.Options.AutoSummon:SetValue(false)
-				SummonStatus:SetDesc(msg .. string.format("\nPulls: %d  |  Gems spent: %d%s", pulls, spent,
+				SummonStatus:SetDesc(msg .. string.format("\nPulls: %d  |  Spent: %d%s", pulls, spent,
 					#best > 0 and ("\nBest: " .. table.concat(best, ", ")) or ""))
 				Collection:Notify(msg)
 			end
@@ -4096,16 +4142,22 @@ task.spawn(function()
 				local n = State.SummonPay == "Gems x10" and 10 or 1
 				local payArg = ({ ["Gems x1"] = "gems", ["Gems x10"] = "gems10", Ticket = "ticket" })[State.SummonPay]
 				local banner = Data.Banners[State.Banner] or {}
-				local cost = State.SummonPay == "Ticket" and 0 or (banner.gem_cost or 50) * n
+				local ticket = State.SummonPay == "Ticket"
+				local have, price, currency = Collection:BannerCurrency(State.Banner)
+				local cost = ticket and 0 or price * n
 				local count, capacity = 0, session.collection.collection_profile_data.capacity
 				for _ in Collection:Owned() do count += 1 end
-				if Collection:Gems() - cost < State.KeepGems then
+				if ticket and banner._no_summon_ticket then
+					stop(tostring(State.Banner) .. " doesn't take summon tickets.")
+				elseif have < cost then
+					stop(string.format("Not enough %s: you have %d, x%d costs %d.", currency, have, n, cost))
+				elseif currency == "Gems" and have - cost < State.KeepGems then
 					stop("Reached your gem reserve (" .. State.KeepGems .. ").")
 				elseif count + n > capacity then
 					stop("Unit storage is full (" .. count .. "/" .. capacity .. ").")
 				else
 					-- one summon a round, like the game's button
-					local beforeGems, before = Collection:Gems(), {}
+					local beforeHave, before = have, {}
 					for uuid in Collection:Owned() do before[uuid] = true end
 					task.spawn(Collection.Invoke, Collection, "buy_from_banner", State.Banner, payArg)
 					local t0, got = os.clock(), 0
@@ -4114,7 +4166,9 @@ task.spawn(function()
 						got = 0
 						for uuid in Collection:Owned() do if not before[uuid] then got += 1 end end
 					until got >= n or os.clock() - t0 > 8 or closed
-					if got == 0 and Collection:Gems() == beforeGems then
+					-- refused = no new unit and none of the banner's currency spent (auto-sold pulls never show as units)
+					local after = Collection:BannerCurrency(State.Banner)
+					if got == 0 and after == beforeHave then
 						refused += 1
 						if refused >= 5 then
 							stop("Summon didn't go through (banner currency, storage or cooldown).")
@@ -4126,7 +4180,7 @@ task.spawn(function()
 					else
 						refused = 0
 						pulls += got
-						spent += math.max(beforeGems - Collection:Gems(), 0)
+						spent += math.max(beforeHave - after, 0)
 						for uuid, u in Collection:Owned() do
 							local rarity = Data.Units[u.unit_id] and Data.Units[u.unit_id].rarity
 							if not before[uuid] and (rarity == "Mythic" or rarity == "Secret") then
@@ -4135,7 +4189,7 @@ task.spawn(function()
 								Collection:Webhook("Rare summons", rarity .. " pulled!", { "**" .. Collection:UnitName(u) .. "**", "Banner: " .. State.Banner })
 							end
 						end
-						SummonStatus:SetDesc(string.format("Pulls: %d  |  Gems spent: %d  |  Gems left: %d%s", pulls, spent, Collection:Gems(),
+						SummonStatus:SetDesc(string.format("Pulls: %d  |  %s spent: %d  |  left: %d%s", pulls, currency, spent, after,
 							#best > 0 and ("\nBest: " .. table.concat(best, ", ")) or ""))
 						Collection:SkipSummonReveal()
 					end
