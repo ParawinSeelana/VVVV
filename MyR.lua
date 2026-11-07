@@ -60,7 +60,7 @@ local State = {
 	-- macro
 	MacroName = nil, AutoSwitchMacro = false, MacroSlotSpots = false,
 	-- match
-	LeaveOnChallenge = false, AutoStart = false, StartDelay = 10, AutoSkip = false,
+	LeaveOnChallenge = false, AutoStart = false, StartDelay = 0, AutoSkip = false,
 	PlayMacro = false, RecordMacro = false, AutoUpgrade = false, UpgradeUntil = 13, UpgradePriority = {}, UpgradeOrder = "Cheapest first",
 	UpgradeCaps = {}, -- unit name -> stop at this upgrade
 	AutoAbility = false, AbilityIgnore = {}, LoopBuffs = false, AutoSell = false, SellWave = 20,
@@ -165,9 +165,11 @@ function Collection:Elevate()
 	if set and Collection.Identity then pcall(set, Collection.Identity) end
 end
 
--- Waits Teleport Delay before an action that sends you to another place. wanted() is checked every tick, so
--- turning the feature off during the wait cancels it; false comes back when it was cancelled or the hub closed.
+-- Waits Teleport Delay before joining from the lobby. wanted() is checked every tick, so turning the feature off
+-- during the wait cancels it; false comes back when it was cancelled or the hub closed. In a match nothing waits:
+-- leaving, next room go at once
 function Collection:TeleportDelay(why, wanted)
+	if not IS_LOBBY then return not closed and wanted() and true or false end
 	if State.TeleportDelay > 0 then Collection:Notify(string.format("%s in %ds", why, State.TeleportDelay)) end
 	local t0 = os.clock()
 	while os.clock() - t0 < State.TeleportDelay do
@@ -321,7 +323,28 @@ local originalInvoke = Client.EndpointsClient.invoke_server
 local assignments = Collection:ReadJson(macroAssignPath, {}) -- "Mode|map" -> macro name
 local recording, recordTarget -- steps recorded this match and the macro they go into
 local MacroStatus
-function Collection:MapKey() return Loader.LevelData and Loader.LevelData.map end
+-- Summer Hunt's "X (Summer)" maps (ids *_summer) are the plain map's ground: same terrain_preset, same name without the
+-- "(...)" (namek_summer -> namek_cartoon, jjk_summer -> jjk_movie). They use its positions and macros
+local SUMMER_BASE = {}
+pcall(function()
+	for id, m in Data.Maps do
+		if type(m) == "table" and type(m.name) == "string" and tostring(id):match("_summer$") then
+			local plain = m.name:gsub("%s*%b()$", "")
+			for other, o in Data.Maps do
+				if other ~= id and type(o) == "table" and o.name == plain and o.terrain_preset == m.terrain_preset then
+					SUMMER_BASE[id] = other
+					break
+				end
+			end
+		end
+	end
+end)
+Collection:Elevate()
+function Collection:BaseMap(map) return SUMMER_BASE[map] or map end
+function Collection:MapKey()
+	local map = Loader.LevelData and Loader.LevelData.map
+	return map and Collection:BaseMap(map)
+end
 function Collection:Wave() return workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value or 0 end
 
 function Collection:MacroPath(name) return macroFolder .. "/" .. name .. ".json" end
@@ -796,7 +819,7 @@ JoinSection:AddDropdown("Loadout", {
 })
 JoinSection:AddSlider("TeleportDelay", {
 	Title = "Teleport Delay (seconds)", Default = 0, Min = 0, Max = 60, Rounding = 0,
-	Description = "Wait before any teleport.",
+	Description = "Wait before joining from the lobby. Leaving a match doesn't wait.",
 	Callback = function(value) State.TeleportDelay = value end,
 })
 -- ids are the keys of the join loop's tries
@@ -1231,7 +1254,7 @@ MatchSection:AddToggle("AutoStart", {
 	Callback = function(value) State.AutoStart = value end,
 })
 MatchSection:AddSlider("StartDelay", {
-	Title = "Start Delay (seconds)", Default = 10, Min = 0, Max = 60, Rounding = 0,
+	Title = "Start Delay (seconds)", Default = 0, Min = 0, Max = 60, Rounding = 0,
 	Callback = function(value) State.StartDelay = value end,
 })
 MatchSection:AddToggle("AutoSkip", {
@@ -2491,6 +2514,7 @@ function Collection:Matchmake(level, label, name, active)
 	if not Collection:TeleportDelay("Matchmaking " .. name, active) then
 		return nil, label .. ": matchmaking cancelled."
 	end
+	Collection:LoadTeam()
 	Collection:Invoke("request_matchmaking", level)
 	JoinStatus:SetDesc(label .. ": matchmaking for " .. name .. "...")
 	local queue, t0 = LP.PlayerGui:FindFirstChild("MatchmakingUI"), os.clock()
@@ -2525,6 +2549,7 @@ function Collection:JoinChallenge(daily)
 				Collection:Invoke("request_leave_lobby", pad.Name)
 				return nil, name .. ": start cancelled."
 			end
+			Collection:LoadTeam()
 			Collection:Invoke("request_start_game", pad.Name)
 			return pad, "Joined " .. name .. ": " .. tostring(c.current_challenge) .. " on " .. tostring(level)
 		end
@@ -2559,6 +2584,7 @@ function Collection:JoinEvent()
 		Collection:Invoke("request_leave_lobby", pad.Name)
 		return nil, "Event: start cancelled."
 	end
+	Collection:LoadTeam()
 	Collection:Invoke("request_start_game", pad.Name)
 	return pad, "Starting event: " .. name
 end
@@ -2634,6 +2660,7 @@ function Collection:StartPortal(mode, label, wanted, open)
 		Collection:Invoke("request_leave_lobby", created.Name)
 		return nil, mode .. ": start cancelled."
 	end
+	Collection:LoadTeam()
 	Collection:Invoke("request_start_game", created.Name)
 	return created, mode .. ": starting " .. label
 end
@@ -2662,6 +2689,7 @@ function Collection:JoinMansion()
 	if not Collection:TeleportDelay("Starting Infinity Mansion room " .. room, function() return State.AutoMansion end) then
 		return nil, "Infinity Mansion: start cancelled."
 	end
+	Collection:LoadTeam()
 	Collection:Invoke("request_start_infinite_tower", room, difficulty)
 	JoinStatus:SetDesc(string.format("Infinity Mansion: starting room %d (%s)...", room, difficulty))
 	task.wait(15)
@@ -2675,15 +2703,21 @@ function Collection:AnyModeOn()
 	return false
 end
 
+-- Team Loadout, swapped in right before a start (pads, portals, matchmaking, Infinity Mansion, a dungeon room), so modes
+-- that can't join don't swap teams. The server takes it while you stand in a pad (probed live 2026-11-05). Once per lobby visit
 local loadoutLoaded = false
+function Collection:LoadTeam()
+	local n = tostring(State.Loadout):match("^Team (%d+)")
+	if n and not loadoutLoaded then
+		loadoutLoaded = true
+		Collection:Invoke("load_team_loadout", n)
+		task.wait(1) -- let the swap land before the start
+	end
+end
 function Collection:JoinStage(mode)
 	local label = State.Stage[mode]
 	local levelId = label and stages[mode].ids[label]
 	if not levelId then return nil, mode .. ": pick a stage." end
-	if State.Loadout ~= "Don't change" and not loadoutLoaded then
-		loadoutLoaded = true
-		Collection:Invoke("load_team_loadout", State.Loadout:match("^Team (%d+)"))
-	end
 	-- the game only offers matchmaking on _MATCHMAKING levels; the rest stay solo
 	if State.JoinBy[mode] == "Matchmaking" and Data.Levels[levelId]._MATCHMAKING then
 		return Collection:Matchmake(levelId, mode, label, function() return State.Join[mode] end)
@@ -2699,6 +2733,7 @@ function Collection:JoinStage(mode)
 		Collection:Invoke("request_leave_lobby", pad.Name)
 		return nil, mode .. ": start cancelled."
 	end
+	Collection:LoadTeam()
 	Collection:Invoke("request_start_game", pad.Name)
 	return pad, "Starting " .. mode .. ": " .. label
 end
@@ -2785,6 +2820,14 @@ function Collection:BuffOf(attack)
 	end
 end
 
+-- an ability that kills your own units in range (Griffin's Sacrifice: aoe damage_allies)
+function Collection:HurtsOwnUnits(attack)
+	for _, aoe in attack and attack.aoe or {} do
+		if aoe.damage_allies then return true end
+	end
+	return false
+end
+
 -- a buff unit: its active ability buffs allies (Commander, Elfy, Windsong...)
 function Collection:IsBuffUnit(m)
 	local ok, id = pcall(Core.UnitServiceCore.get_active_id, m)
@@ -2837,6 +2880,20 @@ end
 local placePending = false -- Auto Place still has units to put down; Place Before Upgrading holds upgrades meanwhile
 local EVENT_MAX_UNITS = 20 -- in events Auto Place stops at this many of your units on the map
 local macroPending = false -- Play Macro still has steps left; Auto Upgrade waits so the macro gets the money
+local allSold = false -- Auto Sell Units At Wave sold everything; Auto Place and Play Macro stop for the rest of the match
+
+-- Seamless Replay (UPD 21): Retry / Next restart the match in this same server, after a loading screen. What's kept
+-- per match starts over on match_rematch_reset; loops compare Collection.Match with the one they started on
+Collection.Match = 1
+if not IS_LOBBY then
+	-- the results screen stays up through the loading screen: Lobby Fallback must not take that for a stuck vote
+	Collection:Track(fromServer.match_rematch_started.OnClientEvent:Connect(function() Collection.MatchEnd = nil end))
+	Collection:Track(fromServer.match_rematch_reset.OnClientEvent:Connect(function()
+		Collection.Match += 1
+		allSold = false
+		recording, recordTarget = State.RecordMacro and {} or nil, nil -- like a fresh server: the replay records anew
+	end))
+end
 
 -- a slot's point: a spot along the first enemy lane at Placement Distance (Farm Placement Distance for money units),
 -- or the position saved for this map and slot
@@ -3196,8 +3253,10 @@ if not IS_LOBBY then task.spawn(function()
 	local markers = {} -- slot -> ball
 	local hologramKey -- what the holograms were laid out for; rebuilt when it changes
 	local bad, refusals, full = {}, {}, {} -- refused spots, refusals in a row per unit, units at their limit
+	local match = Collection.Match
 	while not closed do
 		task.wait(1)
+		if match ~= Collection.Match then match, bad, refusals, full = Collection.Match, {}, {}, {} end
 		Collection:Elevate()
 		local ok, problem = pcall(function()
 			local placed, total = {}, 0
@@ -3249,13 +3308,15 @@ if not IS_LOBBY then task.spawn(function()
 
 			-- events: stop placing once EVENT_MAX_UNITS are on the map; upgrades and abilities carry on
 			local eventFull = Collection:CurrentMode() == "Event" and total >= EVENT_MAX_UNITS
-			if eventFull then pick = nil end
+			if eventFull or allSold then pick = nil end
 			placePending = State.AutoPlace and not State.PlayMacro and pick ~= nil
 			local note
 			if not State.AutoPlace then
 				note = "Auto Place is off."
 			elseif State.PlayMacro then
 				note = "Paused while Play Macro is on."
+			elseif allSold then
+				note = "Auto Sell sold every unit - stopped for this match."
 			elseif eventFull then
 				note = string.format("Event: %d units placed - stopped.", total)
 			elseif not pick then
@@ -3306,7 +3367,10 @@ if not IS_LOBBY then task.spawn(function()
 				Collection:ClearHolograms()
 			end
 		end)
-		if not ok then pcall(PlaceStatus.SetDesc, PlaceStatus, "Auto Place error: " .. tostring(problem)) end
+		if not ok then
+			placePending = false -- a stale true would hold every upgrade (Place Before Upgrading) while Auto Place errors
+			pcall(PlaceStatus.SetDesc, PlaceStatus, "Auto Place error: " .. tostring(problem))
+		end
 	end
 	for _, ball in markers do ball:Destroy() end
 	Collection:ClearHolograms()
@@ -3434,7 +3498,10 @@ if not IS_LOBBY then task.spawn(function()
 	local startChallenge
 	task.spawn(function() startChallenge = (Collection:RefreshChallenge() or {}).current_uuid end)
 	local gameStarted = workspace:WaitForChild("_DATA"):WaitForChild("GameStarted")
-	local soldThisMatch, leaving = false, false
+	local leaving = false
+	Collection:Track(fromServer.match_rematch_reset.OnClientEvent:Connect(function()
+		matchStart, leaving = os.time(), false
+	end))
 
 	Collection:Track(fromServer.start_vote_wave_skip.OnClientEvent:Connect(function()
 		if State.AutoSkip then Collection:Invoke("vote_wave_skip") end
@@ -3442,8 +3509,8 @@ if not IS_LOBBY then task.spawn(function()
 
 	Collection:Track(workspace:WaitForChild("_wave_num").Changed:Connect(function(wave)
 		MatchStatus:SetDesc("Wave " .. tostring(wave) .. "  |  Money " .. tostring(Collection:Money()))
-		if State.AutoSell and not soldThisMatch and wave >= State.SellWave then
-			soldThisMatch = true
+		if State.AutoSell and not allSold and wave >= State.SellWave then
+			allSold = true
 			for _, m in Collection:MyUnits() do Collection:Invoke("sell_unit_ingame", m) end
 			Collection:Notify("Sold all units at wave " .. wave)
 		end
@@ -3459,7 +3526,8 @@ if not IS_LOBBY then task.spawn(function()
 		end
 	end))
 
-	local endHandled = false -- this results screen's match end has run
+	-- this results screen's match end has run; cleared when the screen closes, which a seamless replay does too
+	local endHandled = false
 	local function onMatchEnd(results)
 		endHandled = true
 		dungeonMatchOver = true
@@ -3479,7 +3547,7 @@ if not IS_LOBBY then task.spawn(function()
 				"XP Earn : " .. Collection:Comma(results.xp_reward),
 			})
 		end)
-		task.delay(3, function()
+		task.spawn(function()
 			if closed then return end
 			if Loader.LevelData._dungeon and State.AutoDungeon then return end -- the dungeon loop takes it from here
 			local contract = Loader.LevelData._event_contract
@@ -3500,17 +3568,19 @@ if not IS_LOBBY then task.spawn(function()
 				return
 			end
 			local action, vote = Collection:EndAction(results.victory)
-			if not action or not Collection:TeleportDelay(action, function() return (Collection:EndAction(results.victory)) == action end) then return end
+			if not action then return end
+			-- only the lobby is a teleport: Retry / Next votes replay in this same server (UPD 21), so they don't wait Teleport Delay
+			if action:find("^Back to the lobby") and not Collection:TeleportDelay(action, function() return (Collection:EndAction(results.victory)) == action end) then return end
 			vote()
 		end)
-		-- Lobby Fallback: every way on from the results screen leaves this server, so still being here Fallback After
-		-- seconds past the Auto Next/Retry/Lobby turn means the vote or teleport never went through. The game's Lobby button first, then a
+		-- Lobby Fallback: every way on from the results screen leaves this server or starts a seamless replay (which
+		-- ends this wait), so still here Fallback After seconds past the Auto Next/Retry/Lobby turn means the vote or teleport never went through. The game's Lobby button first, then a
 		-- plain Roblox teleport to the lobby, again each wait. Only while the results screen (ResultsUI) is up, and only for the
 		-- latest match end; the dungeon loop picks its own room
 		local matchEnd = {}
 		Collection.MatchEnd = matchEnd
 		task.spawn(function()
-			local due, tries = os.clock() + 3 + State.TeleportDelay + State.LobbyFallbackWait, 0
+			local due, tries = os.clock() + State.LobbyFallbackWait, 0
 			while not closed and Collection.MatchEnd == matchEnd do
 				task.wait(1)
 				local results = LP.PlayerGui:FindFirstChild("ResultsUI")
@@ -3554,11 +3624,14 @@ if not IS_LOBBY then task.spawn(function()
 		end
 	end))
 
-	-- vote start after a countdown, leaving time to place units or cancel
+	-- vote start after a countdown, leaving time to place units or cancel; again before every seamless replay
 	task.spawn(function()
 		local countdown, lastVote = nil, 0
-		while not closed and not gameStarted.Value do
-			if not State.AutoStart then
+		local finished = workspace._DATA:WaitForChild("GameFinished")
+		while not closed do
+			if gameStarted.Value or finished.Value then
+				countdown = nil
+			elseif not State.AutoStart then
 				countdown = nil
 			else
 				countdown = countdown or State.StartDelay
@@ -3581,6 +3654,7 @@ if not IS_LOBBY then task.spawn(function()
 		local models, taken, bad = {}, {}, {} -- bad: slot-point spots the server refused
 		local homes = {} -- spawn step -> { uuid, pos } of the model it placed
 		local i, tries = 1, 0
+		local match = Collection.Match
 		local function advance() i, tries = i + 1, 0 end
 		local function retry(why)
 			tries += 1
@@ -3642,78 +3716,93 @@ if not IS_LOBBY then task.spawn(function()
 
 		while not closed do
 			task.wait(0.5)
-			-- the macro can still change (picked or auto-switched) until its first step runs
-			if i == 1 and Collection:ActiveMacroName() ~= loaded then
-				loaded = Collection:ActiveMacroName()
-				steps = Collection:LoadMacro(loaded)
-				MacroStatus:SetDesc(string.format("%s / %s -> %s", tostring(Collection:CurrentMode()), tostring(Collection:MapKey()),
-					loaded and (loaded .. " (" .. Collection:MacroSummary(steps) .. ")") or "no macro"))
-			end
-			macroPending = State.PlayMacro and not State.RecordMacro and i <= #steps
-			if i > #steps then
-				if #steps > 0 and not finished then
-					finished = true
-					MacroStatus:SetDesc(loaded .. " finished (" .. #steps .. " steps)")
+			-- one error in a tick must not end playback: macroPending would hold Auto Upgrade for the rest of the match
+			local ok, problem = pcall(function()
+				-- a seamless replay plays the macro again from step 1 (Next may be another map, so another macro)
+				if match ~= Collection.Match then
+					match, loaded, steps, finished, i, tries = Collection.Match, false, {}, false, 1, 0
+					models, taken, bad, homes = {}, {}, {}, {}
 				end
-			elseif State.PlayMacro and not State.RecordMacro then
-				local step = steps[i]
-				local spawnStep = step.type == "spawn" and step or steps[step.unit]
-				local uuid = step.type == "spawn" and step.unit_id and Collection:MacroUnit(step.unit_id)
-				local m = step.unit and stepModel(step.unit)
-				-- the unit on the map, so a fused Vegito shows as Fused Hero, not the Carrot it was recorded as
-				local unitId = m and m.Parent and m._stats.id.Value or spawnStep and spawnStep.unit_id
-				local name = unitId and Collection:UnitName({ unit_id = unitId }) or "?"
-				local function status(note)
-					MacroStatus:SetDesc(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, name, note))
+				-- the macro can still change (picked or auto-switched) until its first step runs
+				if i == 1 and Collection:ActiveMacroName() ~= loaded then
+					loaded = Collection:ActiveMacroName()
+					steps = Collection:LoadMacro(loaded)
+					MacroStatus:SetDesc(string.format("%s / %s -> %s", tostring(Collection:CurrentMode()), tostring(Collection:MapKey()),
+						loaded and (loaded .. " (" .. Collection:MacroSummary(steps) .. ")") or "no macro"))
 				end
-				if step.type == "spawn" and not uuid then
-					MacroStatus:SetDesc(string.format("Step %d/%d skipped: %s isn't on your team", i, #steps, name))
-					advance()
-				elseif step.type == "spawn" then
-					local cost = session.collection:get_upgraded_unit_data(step.unit_id).cost * Core.UnitServiceCore.calculate_spawn_cost_multiplier(session)
-					if Collection:Money() < cost then
-						status("waiting for " .. math.ceil(cost) .. "¥")
-					else
-						local cf, key
-						if State.MacroSlotSpots then cf, key = slotPlacement(uuid, step.unit_id) end
-						if not cf then
-							-- sent on the ground like the game's own placement (Auto Place recordings sit up to 1 stud above it)
-							cf = CFrame.new(table.unpack(step.cf))
-							placeRay.FilterDescendantsInstances = { workspace:FindFirstChild("_terrain") }
-							local ground = workspace:Raycast(cf.Position + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), placeRay)
-							if ground then cf = cf.Rotation + ground.Position end
+				macroPending = State.PlayMacro and not State.RecordMacro and not allSold and i <= #steps
+				if i > #steps then
+					if #steps > 0 and not finished then
+						finished = true
+						MacroStatus:SetDesc(loaded .. " finished (" .. #steps .. " steps)")
+					end
+				elseif allSold then
+					if State.PlayMacro then MacroStatus:SetDesc(string.format("Stopped at step %d/%d: Auto Sell sold every unit", i, #steps)) end
+				elseif State.PlayMacro and not State.RecordMacro then
+					local step = steps[i]
+					local spawnStep = step.type == "spawn" and step or steps[step.unit]
+					local uuid = step.type == "spawn" and step.unit_id and Collection:MacroUnit(step.unit_id)
+					local m = step.unit and stepModel(step.unit)
+					-- the unit on the map, so a fused Vegito shows as Fused Hero, not the Carrot it was recorded as
+					local unitId = m and m.Parent and m._stats.id.Value or spawnStep and spawnStep.unit_id
+					local name = unitId and Collection:UnitName({ unit_id = unitId }) or "?"
+					local function status(note)
+						MacroStatus:SetDesc(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, name, note))
+					end
+					if step.type == "spawn" and not uuid then
+						MacroStatus:SetDesc(string.format("Step %d/%d skipped: %s isn't on your team", i, #steps, name))
+						advance()
+					elseif step.type == "spawn" then
+						local cost = session.collection:get_upgraded_unit_data(step.unit_id).cost * Core.UnitServiceCore.calculate_spawn_cost_multiplier(session)
+						if Collection:Money() < cost then
+							status("waiting for " .. math.ceil(cost) .. "¥")
+						else
+							local cf, key
+							if State.MacroSlotSpots then cf, key = slotPlacement(uuid, step.unit_id) end
+							if not cf then
+								-- sent on the ground like the game's own placement (Auto Place recordings sit up to 1 stud above it)
+								cf = CFrame.new(table.unpack(step.cf))
+								placeRay.FilterDescendantsInstances = { workspace:FindFirstChild("_terrain") }
+								local ground = workspace:Raycast(cf.Position + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), placeRay)
+								if ground then cf = cf.Rotation + ground.Position end
+							end
+							if Collection:Invoke("spawn_unit", uuid, cf) then
+								models[i] = spawnedModel(uuid, cf.Position)
+								homes[i] = models[i] and { uuid = uuid, pos = models[i]:GetPivot().Position }
+								advance()
+							else
+								if key then bad[key] = true end
+								retry("server refused the spawn")
+							end
 						end
-						if Collection:Invoke("spawn_unit", uuid, cf) then
-							models[i] = spawnedModel(uuid, cf.Position)
-							homes[i] = models[i] and { uuid = uuid, pos = models[i]:GetPivot().Position }
+					elseif not (m and m.Parent) then
+						MacroStatus:SetDesc(string.format("Step %d/%d skipped: its unit isn't on the map", i, #steps))
+						advance()
+					elseif step.type == "upgrade" then
+						local cost = Collection:UpgradeCost(m)
+						if not cost then
+							advance()
+						elseif Collection:Money() < cost then
+							status("waiting for " .. cost .. "¥")
+						elseif Collection:Invoke("upgrade_unit_ingame", m) then
 							advance()
 						else
-							if key then bad[key] = true end
-							retry("server refused the spawn")
+							retry("server refused the upgrade")
 						end
-					end
-				elseif not (m and m.Parent) then
-					MacroStatus:SetDesc(string.format("Step %d/%d skipped: its unit isn't on the map", i, #steps))
-					advance()
-				elseif step.type == "upgrade" then
-					local cost = Collection:UpgradeCost(m)
-					if not cost then
-						advance()
-					elseif Collection:Money() < cost then
-						status("waiting for " .. cost .. "¥")
-					elseif Collection:Invoke("upgrade_unit_ingame", m) then
-						advance()
+					elseif step.type == "ability" and Collection:IsBuffUnit(m) then
+						advance() -- buff units are Loop Buffs' job
+					elseif Collection:Wave() < step.wave then
+						status("waiting for wave " .. step.wave)
 					else
-						retry("server refused the upgrade")
+						Collection:Invoke(step.type == "sell" and "sell_unit_ingame" or "use_active_attack", m)
+						advance()
 					end
-				elseif step.type == "ability" and Collection:IsBuffUnit(m) then
-					advance() -- buff units are Loop Buffs' job
-				elseif Collection:Wave() < step.wave then
-					status("waiting for wave " .. step.wave)
-				else
-					Collection:Invoke(step.type == "sell" and "sell_unit_ingame" or "use_active_attack", m)
-					advance()
 				end
+			end)
+			if not ok then
+				Collection:Elevate()
+				MacroStatus:SetDesc(string.format("Step %d/%d error: %s", i, #steps, tostring(problem)))
+				retry("error: " .. tostring(problem)) -- the 5th error in a row skips the step
 			end
 		end
 	end)
@@ -3724,6 +3813,8 @@ if not IS_LOBBY then task.spawn(function()
 		local pendingBuff = {} -- active id -> true while a Loop Buffs recast is scheduled, and 1s after it lands
 		-- how long each buff really lasts, from the server's own buff messages: upgrades and traits change it per player
 		local buffTimes = {} -- active id -> seconds
+		-- unit -> os.clock() it's skipped until: one the server keeps refusing mustn't take every tick from the rest
+		local refused = setmetatable({}, { __mode = "k" })
 		Collection:Track(fromServer.buff_on.OnClientEvent:Connect(function(_, _, _, params)
 			local caster = type(params) == "table" and params.attacker_unit
 			if typeof(caster) == "Instance" and type(params.buff_time) == "number" then
@@ -3743,9 +3834,10 @@ if not IS_LOBBY then task.spawn(function()
 				elseif State.AutoPlace and State.PlaceBeforeUpgrade and placePending then
 					note = "Waiting for Auto Place to place every slot (Place Before Upgrading is on)."
 				else
-					-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order. Only what the
-					-- money covers now: while a ticked unit saves up for its next upgrade, the money goes on down the list
-					local rank, best, money, waiting = {}, nil, Collection:Money(), nil
+					-- ticked Upgrade Priority units by their row, top first; the rest after them by Upgrade Order. The first in
+					-- that order saves up for its upgrade: spending on cheaper units further down starved it (a farm never got
+					-- its upgrades under Farms first while the money went on Fishi / Elf Mage)
+					local rank, best, money = {}, nil, Collection:Money()
 					for i, entry in State.UpgradePriority do
 						if entry.on then rank[entry.id] = i end
 					end
@@ -3763,27 +3855,25 @@ if not IS_LOBBY then task.spawn(function()
 						local after = slotWave[m._stats.uuid.Value] or 0
 						if cost and wave < after then
 							held = math.min(held or after, after)
-						elseif cost and m._stats.upgrade.Value < cap and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
-							if cost > money then
-								-- the cheapest one still saving up goes next
-								if not waiting or cost < waiting.cost then waiting = { model = m, cost = cost } end
-							else
-								local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
-								local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
-									or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
-								if not best or r < best.rank or (r == best.rank and score > best.score) then
-									best = { model = m, cost = cost, score = score, rank = r }
-								end
+						elseif cost and m._stats.upgrade.Value < cap and (refused[m] or 0) <= os.clock()
+							and not (State.UpgradeOnlyKept and u.unit_id and not Collection:Kept(u)) then
+							local r = u.unit_id and rank[Collection:UnitName(u)] or math.huge
+							local score = State.UpgradeOrder == "Strongest first" and m._stats.damage.Value
+								or -cost + (State.UpgradeOrder == "Farms first" and Collection:IsFarm(m._stats.id.Value) and 1e9 or 0)
+							if not best or r < best.rank or (r == best.rank and score > best.score) then
+								best = { model = m, cost = cost, score = score, rank = r }
 							end
 						end
 					end
 					local function name(m) return Collection:UnitName({ unit_id = m._stats.id.Value }) end
-					if best then
+					if best and best.cost > money then
+						note = string.format("Next: %s - waiting for %s¥", name(best.model), Collection:Comma(best.cost))
+					elseif best then
 						local level = best.model._stats.upgrade.Value + 1
-						note = string.format(Collection:Invoke("upgrade_unit_ingame", best.model) and "Upgraded %s to %d (%s¥)"
-							or "Server refused upgrading %s to %d (%s¥)", name(best.model), level, Collection:Comma(best.cost))
-					elseif waiting then
-						note = string.format("Next: %s - waiting for %s¥", name(waiting.model), Collection:Comma(waiting.cost))
+						local done = Collection:Invoke("upgrade_unit_ingame", best.model)
+						if not done then refused[best.model] = os.clock() + 10 end
+						note = string.format(done and "Upgraded %s to %d (%s¥)"
+							or "Server refused upgrading %s to %d (%s¥) - upgrading the others for 10s", name(best.model), level, Collection:Comma(best.cost))
 					elseif held then
 						note = string.format("Waiting for wave %d (Upgrade After Wave).", held)
 					else
@@ -3817,6 +3907,7 @@ if not IS_LOBBY then task.spawn(function()
 					end
 					if abilityDue and attack and ready and not buff -- buff units are Loop Buffs' job
 						and not (attack.custom_client_script and attack.custom_client_script.active_start)
+						and not Collection:HurtsOwnUnits(attack) -- never a blind cast of Griffin's Sacrifice
 						and not State.AbilityIgnore[Collection:UnitName(Collection:Unit(st.uuid.Value) or {})] then
 						Collection:Invoke("use_active_attack", m)
 					end
@@ -4021,6 +4112,7 @@ task.spawn(function()
 				elseif choice and Collection:TeleportDelay("Entering room " .. choice, function() return State.AutoDungeon and (dungeonMatchOver or lobbyFree()) end) then
 					lastEnter = os.clock()
 					note = "Entering room " .. choice .. ": " .. Collection:DescribeRoom(room)
+					if lobbyFree() then Collection:LoadTeam() end
 					act("dungeon_enter_room", choice)
 				end
 			elseif not dd._started and State.DungeonStart and lobbyFree() and os.clock() - lastStart > 10 then
