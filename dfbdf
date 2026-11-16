@@ -1,0 +1,1656 @@
+-- Anime Crusaders X hub (VaderHug on Starlight Lite)
+-- loadstring(readfile("ACX_Hub.lua"))()   -- StarlightLite.lua next to it, or hosted at LITE_URL
+if game.GameId == 7660436108 then
+repeat task.wait() until game:IsLoaded()
+
+local Env = (getgenv and getgenv()) or _G
+if Env.ACXHub then pcall(Env.ACXHub.Unload) end
+
+local LITE_URL = "https://raw.githubusercontent.com/DONUT6599/ddgdhdf/main/StarlightLite.lua"
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local Http = game:GetService("HttpService")
+local CS = game:GetService("CollectionService")
+local LP = Players.LocalPlayer
+
+--------------------------- [[ Game ]] ---------------------------
+
+local Loader = require(RS.Framework.Loader)
+local function Lazy(load)
+	return setmetatable({}, { __index = function(t, k)
+		local m = load(script, k)
+		rawset(t, k, m)
+		return m
+	end })
+end
+local Data, Core, Client = Lazy(Loader.load_data), Lazy(Loader.load_core_service), Lazy(Loader.load_client_service)
+
+-- from autoexec this runs before the game's services are up
+while not (Client.UnitCollectionServiceClient.session and Client.UnitCollectionServiceClient.session._initialized) do task.wait(0.5) end
+local session = Client.UnitCollectionServiceClient.session
+local EP = Client.EndpointsClient
+local fromServer = RS.endpoints.server_to_client
+local IS_LOBBY = workspace._MAP_CONFIG.IsLobby.Value
+if not IS_LOBBY then
+	while not Loader.LevelData do task.wait(0.5) end
+end
+
+local closed = false
+local Connections = {}
+local function Track(c) table.insert(Connections, c) return c end
+
+-- game code run on a hub thread can drop the executor's thread identity; UI writes need it back
+local Identity = getthreadidentity and getthreadidentity()
+local function Elevate()
+	local set = setthreadidentity or set_thread_identity
+	if set and Identity then pcall(set, Identity) end
+end
+
+local origInvoke = Env.ACXOrigInvoke or EP.invoke_server
+Env.ACXOrigInvoke = origInvoke
+local function Invoke(name, ...)
+	local ok, a, b, c = pcall(EP.invoke_server, name, ...) -- the recorder's wrapper, so hub actions land in macros
+	if ok then return a, b, c end
+	return nil
+end
+
+local function Gems() return LP._stats.gem_amount.Value end
+local function Money() return LP._stats.resource.Value end
+local function Wave() return workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value or 0 end
+local function Profile() return session.collection.collection_profile_data end
+local function Owned(uuid) return uuid and (Profile().owned_units[uuid] or (session.collection.temporary_units or {})[uuid]) end
+local function Equipped() return session.override_equipped_units or Profile().equipped_units end
+local function SlotUuid(slot)
+	local eq = Equipped()
+	return eq[slot] or eq[tonumber(slot)] or eq[tostring(slot)]
+end
+local function UnitName(unitId) local d = Data.Units[unitId] return d and d.name or tostring(unitId) end
+local function IsFarm(unitId)
+	local d = Data.Units[unitId]
+	return d ~= nil and ((d.farm_amount or 0) > 0 or (d.tags ~= nil and table.find(d.tags, "Farm") ~= nil))
+end
+local SLOTS = Data.GameplaySettings.UNIT_SLOTS or { 1, 2, 3, 4, 5, 6 }
+
+-- your units on the map (enemies share _UNITS; their _stats have no player)
+local function MyUnits()
+	local list = {}
+	for _, m in workspace:FindFirstChild("_UNITS") and workspace._UNITS:GetChildren() or {} do
+		local st = m:FindFirstChild("_stats")
+		local owner = st and st:FindFirstChild("player")
+		if owner and owner.Value == LP and st:FindFirstChild("upgrade") and not CS:HasTag(m, "minion_units") then
+			table.insert(list, m)
+		end
+	end
+	return list
+end
+-- the placed copy's own id (upgrade / sell / ability take it); _stats.uuid is the collection unit
+local function InstanceId(m) return m._stats:GetAttribute("uuid") end
+
+local function SpawnCost(unitId)
+	local ok, d = pcall(function() return session.collection:get_upgraded_unit_data(unitId) end)
+	local base = (ok and d and d.cost) or (Data.Units[unitId] and Data.Units[unitId].cost) or 0
+	local okm, mult = pcall(Core.UnitServiceCore.calculate_spawn_cost_multiplier, session)
+	return math.ceil(base * (okm and tonumber(mult) or 1))
+end
+-- next upgrade's cost, or nil when maxed
+local function UpgradeCost(m)
+	local st = m._stats
+	local def = Data.Units[st.id.Value]
+	local nextUp = def and def.upgrade and def.upgrade[st.upgrade.Value + 1]
+	if not nextUp or st.upgrade.Value >= (st:FindFirstChild("max_upgrade") and st.max_upgrade.Value or math.huge) then return nil end
+	local mult = st:FindFirstChild("upgrade_cost_multiplier") and st.upgrade_cost_multiplier.Value or 1
+	return math.ceil(nextUp.cost * mult)
+end
+
+-- how strong a unit gets (the Farmer's rank): DPS at its last upgrade tier, with this copy's traits and stat rolls
+-- counted by the game's own multipliers. unit = the owned unit's record
+local function UnitDps(data, unit)
+	local damage, cooldown = data.damage, data.attack_cooldown
+	for _, tier in type(data.upgrade) == "table" and data.upgrade or {} do
+		damage, cooldown = tier.damage or damage, tier.attack_cooldown or cooldown
+	end
+	local dps = damage and cooldown and cooldown ~= 0 and damage / cooldown or 0
+	local T = unit and Core.TraitServiceCore
+	if not T then return dps end
+	local ok, dmg, cd = pcall(function()
+		return T.calculate_trait_multiplier(unit, "increase_damage") * T.calculate_total_stat_multiplier(unit, "increase_damage"),
+			T.calculate_trait_multiplier(unit, "decrease_cooldown") * T.calculate_total_stat_multiplier(unit, "decrease_cooldown")
+	end)
+	if not ok or type(dmg) ~= "number" or type(cd) ~= "number" or cd <= 0 then return dps end
+	return dps * dmg / cd
+end
+
+local State -- set below; NextUpgrade reads it
+-- the next upgrade among your units on the map (nil when none has one left). Ticked Upgrade Priority units go first,
+-- top row first, and saving up for one holds the rest back (AA). The rest by Upgrade Order; Smart is the Farmer's:
+-- farms first, the cheapest, nothing else while saving for one; then the damage units, the strongest one money pays
+-- for right now (else saving for the cheapest of them); buff units last, once nothing else has an upgrade left
+local function NextUpgrade()
+	local rank = {}
+	for i, e in State.UpgradePriority do
+		if e.on then rank[e.id] = i end
+	end
+	local list = {}
+	for _, m in MyUnits() do
+		local st = m._stats
+		local cost = UpgradeCost(m)
+		if cost and st.upgrade.Value < State.UpgradeUntil then
+			local u = Owned(st.uuid.Value)
+			local d = Data.Units[st.id.Value] or {}
+			table.insert(list, {
+				model = m, cost = cost, prio = u and rank[UnitName(u.unit_id)] or math.huge, damage = st.damage.Value,
+				farm = IsFarm(st.id.Value), buff = d._show_as_buff_unit == true,
+				rank = math.floor(UnitDps(d, u)) * 1000 + st.upgrade.Value,
+			})
+		end
+	end
+	local top
+	for _, c in list do
+		if c.prio < math.huge and (not top or c.prio < top.prio or (c.prio == top.prio and c.cost < top.cost)) then top = c end
+	end
+	if top then return top end
+	if State.UpgradeOrder == "Smart" then
+		local farms, hitters, buffs = {}, {}, {}
+		for _, c in list do table.insert(c.buff and buffs or c.farm and farms or hitters, c) end
+		local function pick(group, strongest)
+			local best, cheapest
+			for _, c in group do
+				if not cheapest or c.cost < cheapest.cost then cheapest = c end
+				if strongest and c.cost <= Money() and (not best or c.rank > best.rank) then best = c end
+			end
+			return best or cheapest
+		end
+		return pick(farms) or pick(hitters, true) or pick(buffs)
+	end
+	local best
+	for _, c in list do
+		c.score = State.UpgradeOrder == "Strongest first" and c.damage
+			or -c.cost + (State.UpgradeOrder == "Farms first" and c.farm and 1e9 or 0)
+		if not best or c.score > best.score then best = c end
+	end
+	return best
+end
+
+local function CurrentMode()
+	local d = Loader.LevelData
+	if not d then return nil end
+	local w = d.world and Data.Worlds[d.world]
+	if d._challenge then return "Challenge" end
+	if w and w.legend_stage then return "Legend" end
+	if (w and w.raid_world) or d._gamemode == "raid" then return "Raid" end
+	if d._gamemode == "infinite" or d.infinite then return "Infinite" end
+	if d._is_actual_storymode then return "Story" end
+	return "Other"
+end
+local function MapKey() return Loader.LevelData and Loader.LevelData.map end
+
+--------------------------- [[ Files ]] ---------------------------
+
+local canFile = type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+	and type(makefolder) == "function" and type(isfolder) == "function"
+local FOLDER = "VaderHug/AnimeCrusadersX"
+local PROFILE = FOLDER .. "/" .. LP.Name .. ".json"
+local MACROS = FOLDER .. "/macros"
+local ASSIGN = FOLDER .. "/macro_assignments.json"
+local SPOTS = FOLDER .. "/place_positions.json"
+if canFile then
+	for _, f in { "VaderHug", FOLDER, MACROS } do
+		if not isfolder(f) then makefolder(f) end
+	end
+end
+local function ReadJson(path, default)
+	if canFile and isfile(path) then
+		local ok, data = pcall(function() return Http:JSONDecode(readfile(path)) end)
+		if ok and type(data) == "table" then return data end
+	end
+	return default
+end
+local function WriteJson(path, data)
+	if canFile then pcall(writefile, path, Http:JSONEncode(data)) end
+end
+
+State = {
+	-- lobby
+	AutoJoin = false, JoinMode = "Story", JoinWorld = nil, JoinAct = "1", Difficulty = "Normal", FriendsOnly = true,
+	-- match
+	AutoStart = false, StartDelay = 5, AutoSkip = false, EndAction = "Nothing", TeleportDelay = 0,
+	AutoSell = false, SellWave = 20, LobbyAtWave = false, LobbyWave = 30,
+	-- auto play
+	AutoPlace = false, FarmsFirst = false, PlaceDistance = 50, FarmPlaceDistance = 50, ShowPlacePoint = true, ShowHolograms = true, Slots = {},
+	AutoUpgrade = false, UpgradeUntil = 15, UpgradeOrder = "Cheapest first", PlaceBeforeUpgrade = true,
+	UpgradePriority = {}, -- { { id = unit name, on = ticked } } top first
+	AutoAbility = false, AbilityIgnore = {},
+	-- macro
+	MacroName = nil, PlayMacro = false, MacroSlotSpots = false, AutoSwitchMacro = false,
+	-- summon / rewards / misc
+	Banner = nil, SummonAmount = "x10", AutoSummon = false, KeepGems = 0,
+	AutoCodes = false, AutoQuests = false, AutoDaily = false, AutoBattlePass = false,
+	AntiAfk = true,
+}
+for _, slot in SLOTS do State.Slots[tostring(slot)] = { On = true, Mode = "Enemy path", Max = 6 } end
+do
+	local saved = ReadJson(PROFILE, {})
+	for k, v in saved do
+		if k == "Slots" and type(v) == "table" then
+			for slot, cfg in v do
+				if State.Slots[slot] and type(cfg) == "table" then
+					for f, x in cfg do State.Slots[slot][f] = x end
+				end
+			end
+		elseif State[k] ~= nil or k == "MacroName" or k == "JoinWorld" or k == "Banner" then
+			State[k] = v
+		end
+	end
+end
+State.RecordMacro = false -- never restored: records only while you turn it on, until the match ends
+
+local saveQueued = false
+local function Save()
+	if saveQueued then return end
+	saveQueued = true
+	task.delay(1, function()
+		saveQueued = false
+		WriteJson(PROFILE, State)
+	end)
+end
+
+local placePositions = ReadJson(SPOTS, {}) -- "map|slot" -> { x, y, z }
+local assignments = ReadJson(ASSIGN, {}) -- "Mode|map" -> macro name
+
+--------------------------- [[ UI ]] ---------------------------
+
+Env.InterfaceName = "VaderHug"
+local Starlight = loadstring(canFile and isfile("StarlightLite.lua") and readfile("StarlightLite.lua") or game:HttpGet(LITE_URL))()
+Starlight.FileSystem.Folder = "VaderHug"
+Starlight.WindowKeybind = "RightControl"
+pcall(Starlight.SetTheme, Starlight, "Tokyo Night") -- starting theme; one saved as autoload in Settings replaces it
+
+local function Notify(text)
+	Elevate()
+	pcall(Starlight.Notification, Starlight, { Title = "VaderHug", Content = tostring(text), Duration = 4 })
+end
+
+-- the VaderHug logo, as the VaderHug wrapper puts it in: Starlight only takes asset ids, so the downloaded image
+-- (cached as VaderHug_logo.png) goes in by hand after the window is made
+local LOGO_URL = "https://github.com/DONUT6599/ddgdhdf/blob/main/Asset_1.png?raw=true"
+local function IsImageData(data)
+	if type(data) ~= "string" or #data < 100 then return false end
+	if data:sub(1, 8) == "\137PNG\r\n\26\n" then return data:sub(-8, -5) == "IEND" end
+	return data:sub(1, 3) == "\255\216\255"
+end
+local function LogoAsset()
+	local get = getcustomasset or getsynasset
+	if not (get and canFile) then return nil end
+	-- only a whole image may reach getcustomasset: a cut-off download crashes the client on every launch
+	if not IsImageData(isfile("VaderHug_logo.png") and readfile("VaderHug_logo.png") or nil) then
+		local ok, data = pcall(game.HttpGet, game, LOGO_URL)
+		if not ok or not IsImageData(data) then return nil end
+		writefile("VaderHug_logo.png", data)
+	end
+	-- getcustomasset can close Roblox outright on some PCs: the flag still saying "running" means the last call
+	-- never came back, so the logo is skipped from then on (delete VaderHug_asset_check.txt to try again)
+	if isfile("VaderHug_asset_check.txt") and readfile("VaderHug_asset_check.txt") == "running" then return nil end
+	writefile("VaderHug_asset_check.txt", "running")
+	local ok, id = pcall(get, "VaderHug_logo.png")
+	writefile("VaderHug_asset_check.txt", "done")
+	return ok and id or nil
+end
+local Logo = LogoAsset()
+
+local Window = Starlight:CreateWindow({
+	Name = "VaderHug",
+	Subtitle = "Anime Crusaders X",
+	LoadingSettings = { Title = "VaderHug", Subtitle = "Anime Crusaders X", Logo = Logo and 0 or nil }, -- 0: a logo replaces the spinner
+	FileSettings = { ConfigFolder = "AnimeCrusadersX" },
+	BuildWarnings = false,
+})
+if Logo then
+	-- white = the logo's own colours (Starlight tints its icons to the theme)
+	local function Put(image)
+		image.Image = Logo
+		image.ImageColor3 = Color3.new(1, 1, 1)
+	end
+	pcall(Put, Window.Instance.Sidebar.Icon)
+	pcall(Put, Starlight.Instance.MobileToggle)
+	local screen = Window.Instance:FindFirstChild("New Loading Screen")
+	if screen then pcall(Put, screen.Frame.ImageLabel.Image) end
+	-- notifications get the logo as their icon
+	Track(Starlight.Instance.Notifications.ChildAdded:Connect(function(card)
+		task.defer(function()
+			local icon = card:FindFirstChild("Icon")
+			if icon and icon:IsA("ImageLabel") and (icon.Image == "" or icon.Image == "rbxassetid://") then Put(icon) end
+		end)
+	end))
+end
+
+local ids = 0
+local function Id(prefix) ids += 1 return prefix .. ids end
+
+-- a few binders: each control reads its value from tbl[field] and writes it back, then saves
+local function Toggle(box, tbl, field, name, tip, onChange)
+	return box:CreateToggle({
+		Name = name, Tooltip = tip, Style = 2, CurrentValue = tbl[field] == true,
+		Callback = function(v)
+			if tbl[field] == v then return end
+			tbl[field] = v
+			Save()
+			if onChange then task.spawn(onChange, v) end
+		end,
+	}, Id("Toggle"))
+end
+local function Slider(box, tbl, field, name, min, max, tip)
+	return box:CreateSlider({
+		Name = name, Tooltip = tip, Range = { min, max }, Increment = 1, CurrentValue = tonumber(tbl[field]) or min,
+		Callback = function(v)
+			v = tonumber(v)
+			if not v or tbl[field] == v then return end
+			tbl[field] = v
+			Save()
+		end,
+	}, Id("Slider"))
+end
+-- single pick: tbl[field] = the option; multi: tbl[field] = { [option] = true }
+local function Dropdown(box, tbl, field, name, options, tip, onChange, multi)
+	local current = {}
+	if multi then
+		for k in tbl[field] or {} do table.insert(current, k) end
+	elseif tbl[field] ~= nil then
+		current = { tbl[field] }
+	end
+	local dd = box:CreateLabel({ Name = name, Tooltip = tip }, Id("Label")):AddDropdown({
+		Options = options, CurrentOption = current, MultipleOptions = multi == true, Placeholder = "--",
+		Callback = function(list)
+			list = type(list) == "table" and list or { list }
+			local v
+			if multi then
+				v = {}
+				for _, k in list do v[k] = true end
+			else
+				v = list[1]
+				if v == nil or v == tbl[field] then return end
+			end
+			tbl[field] = v
+			Save()
+			if onChange then task.spawn(onChange, v) end
+		end,
+	}, Id("Dropdown"))
+	return dd
+end
+local function SetOptions(dd, options, current)
+	Elevate()
+	pcall(dd.Set, dd, { Options = options, CurrentOption = current ~= nil and { current } or {} })
+end
+local function Button(box, name, tip, fn)
+	return box:CreateButton({ Name = name, Tooltip = tip, Callback = function() task.spawn(fn) end }, Id("Button"))
+end
+local function Input(box, name, placeholder)
+	local value = ""
+	box:CreateInput({
+		Name = name, PlaceholderText = placeholder, CurrentValue = "",
+		Callback = function(text) value = tostring(text or "") end,
+	}, Id("Input"))
+	return function() return value end
+end
+-- a paragraph that only redraws when its text changes
+local function Status(box, title, text)
+	local p = box:CreateParagraph({ Name = title, Content = text }, Id("Paragraph"))
+	local last = text
+	return function(t)
+		t = tostring(t)
+		if t == last then return end
+		last = t
+		Elevate()
+		pcall(p.Set, p, { Content = t })
+	end
+end
+
+local FarmSection = Window:CreateTabSection("Farm")
+local AccountSection = Window:CreateTabSection("Account")
+local function NewTab(section, name) return section:CreateTab({ Name = name, Columns = 2 }, Id("Tab")) end
+local Tabs = {
+	Main = NewTab(FarmSection, "Main"),
+	Match = NewTab(FarmSection, "Match"),
+	AutoPlay = NewTab(FarmSection, "Auto Play"),
+	Macro = NewTab(FarmSection, "Macro"),
+	Summon = NewTab(AccountSection, "Summon"),
+	Rewards = NewTab(AccountSection, "Rewards"),
+	Settings = NewTab(AccountSection, "Settings"),
+}
+local function Box(tab, name, column) return tab:CreateGroupbox({ Name = name, Column = column }, Id("Groupbox")) end
+
+--------------------------- [[ Stages ]] ---------------------------
+
+-- every playable world per mode, easiest first: { name, acts = { { label, id } } }
+local MODES = { "Story", "Legend", "Raid" }
+local Stages = { Story = {}, Legend = {}, Raid = {} }
+for key, w in Data.Worlds do
+	local mode = (w.legend_stage and "Legend") or (w.raid_world and "Raid") or (w.infinite and "Story") or nil
+	if mode and not w.infinity_castle and not w.sandbox and type(w.levels) == "table" and next(w.levels) then
+		local acts = {}
+		for act, level in w.levels do table.insert(acts, { n = tonumber(act) or 0, label = "Act " .. act, id = level.id }) end
+		table.sort(acts, function(a, b) return a.n < b.n end)
+		if w.infinite and w.infinite.id then table.insert(acts, { n = 99, label = "Infinite", id = w.infinite.id }) end
+		table.insert(Stages[mode], { name = w.name or key, key = key, rank = w.recommended_level or 0, acts = acts })
+	end
+end
+for _, list in Stages do
+	table.sort(list, function(a, b) return a.rank < b.rank or (a.rank == b.rank and a.name < b.name) end)
+	local seen = {}
+	for _, s in list do
+		if seen[s.name] then s.name = s.name .. " (" .. s.key .. ")" end
+		seen[s.name] = true
+	end
+end
+local function WorldNames(mode)
+	local out = {}
+	for _, s in Stages[mode] or {} do table.insert(out, s.name) end
+	return out
+end
+local function SelectedWorld()
+	for _, s in Stages[State.JoinMode] or {} do
+		if s.name == State.JoinWorld then return s end
+	end
+end
+local function ActNames()
+	local out = {}
+	for _, a in (SelectedWorld() or { acts = {} }).acts do table.insert(out, a.label) end
+	return out
+end
+local function SelectedLevel()
+	for _, a in (SelectedWorld() or { acts = {} }).acts do
+		if a.label == State.JoinAct then return a.id end
+	end
+end
+
+-- every map, for macro assignments: "Name [map]"
+local mapLabels = { "Any map" }
+do
+	local seen = {}
+	for _, w in Data.Worlds do
+		if w.map and not seen[w.map] and not w.sandbox then
+			seen[w.map] = true
+			table.insert(mapLabels, (w.name or w.map) .. " [" .. w.map .. "]")
+		end
+	end
+	table.sort(mapLabels, function(a, b) return a == "Any map" or (b ~= "Any map" and a < b) end)
+end
+
+--------------------------- [[ Main Tab ]] ---------------------------
+
+local TeleportDelay -- defined with the match helpers
+
+local JoinBox = Box(Tabs.Main, "Auto Join", 1)
+local JoinStatus = Status(JoinBox, "Status", IS_LOBBY and "In the lobby." or "In a match.")
+local worldDropdown, actDropdown
+Dropdown(JoinBox, State, "JoinMode", "Mode", MODES, nil, function()
+	State.JoinWorld, State.JoinAct = nil, nil
+	SetOptions(worldDropdown, WorldNames(State.JoinMode), nil)
+	SetOptions(actDropdown, {}, nil)
+end)
+worldDropdown = Dropdown(JoinBox, State, "JoinWorld", "World", WorldNames(State.JoinMode), "Locked worlds just get refused.", function()
+	local acts = ActNames()
+	State.JoinAct = acts[1]
+	Save()
+	SetOptions(actDropdown, acts, State.JoinAct)
+end)
+actDropdown = Dropdown(JoinBox, State, "JoinAct", "Act", ActNames())
+Dropdown(JoinBox, State, "Difficulty", "Difficulty", { "Normal", "Hard" }, "Story only; Legend and Raid are always Hard.")
+Toggle(JoinBox, State, "FriendsOnly", "Friends Only")
+Toggle(JoinBox, State, "AutoJoin", "Auto Join", "Joins the picked act from the lobby.")
+
+local function JoinNow()
+	local level = SelectedLevel()
+	if not level then return false, "Pick a world and act first." end
+	local difficulty = State.JoinMode == "Story" and State.Difficulty or "Hard"
+	local lobby = Invoke("playhub_enter_stage", level, State.FriendsOnly == true, difficulty)
+	if type(lobby) ~= "string" then return false, "The game refused " .. level .. " (locked, or you're in a lobby already)." end
+	task.wait(1)
+	Invoke("request_start_game", lobby)
+	return true, "Joining " .. State.JoinWorld .. " " .. tostring(State.JoinAct)
+end
+Button(JoinBox, "Join Now", nil, function()
+	if not IS_LOBBY then return Notify("Go to the lobby first.") end
+	local _, why = JoinNow()
+	Notify(why)
+end)
+
+--------------------------- [[ Match Tab ]] ---------------------------
+
+local MatchBox = Box(Tabs.Match, "Match", 1)
+local MatchStatus = Status(MatchBox, "Status", IS_LOBBY and "In the lobby." or "Waiting for the match...")
+Toggle(MatchBox, State, "AutoStart", "Auto Start", "Votes start after Start Delay.")
+Slider(MatchBox, State, "StartDelay", "Start Delay (s)", 0, 60)
+Toggle(MatchBox, State, "AutoSkip", "Auto Skip Waves", "Votes yes on every wave skip.")
+Dropdown(MatchBox, State, "EndAction", "When The Match Ends", { "Nothing", "Replay", "Next Stage", "Lobby" }, "Next Stage replays when there's no next.")
+Slider(MatchBox, State, "TeleportDelay", "Teleport Delay (s)", 0, 30, "Wait before Replay / Next / Lobby / Join.")
+
+local LeaveBox = Box(Tabs.Match, "Sell & Leave", 2)
+Toggle(LeaveBox, State, "AutoSell", "Sell All At Wave")
+Slider(LeaveBox, State, "SellWave", "Sell Wave", 1, 100)
+Toggle(LeaveBox, State, "LobbyAtWave", "Lobby At Wave")
+Slider(LeaveBox, State, "LobbyWave", "Lobby Wave", 1, 100)
+
+-- waits Teleport Delay; false when wanted() turns false meanwhile or the hub closed
+function TeleportDelay(why, wanted)
+	if State.TeleportDelay > 0 then Notify(string.format("%s in %ds", why, State.TeleportDelay)) end
+	local t0 = os.clock()
+	while os.clock() - t0 < State.TeleportDelay do
+		if closed or not wanted() then return false end
+		task.wait(0.2)
+	end
+	return not closed and wanted()
+end
+
+--------------------------- [[ Paths & Spots ]] ---------------------------
+
+-- the map's enemy lanes from the game's path cache: { { points = { { position, distance_from_spawn } } } }
+local function Lanes()
+	local pve = workspace:FindFirstChild("_BASES") and workspace._BASES:FindFirstChild("pve")
+	local folder = pve and pve:FindFirstChild("LANES")
+	local cache = pve and Core.PathService.PATH_CACHE and Core.PathService.PATH_CACHE[pve]
+	local list = {}
+	for _, lane in folder and folder:GetChildren() or {} do
+		local c = cache and cache[lane]
+		if c and c.points and #c.points >= 2 then table.insert(list, { name = lane.Name, points = c.points }) end
+	end
+	table.sort(list, function(a, b) return (tonumber(a.name) or 99) < (tonumber(b.name) or 99) end)
+	return list
+end
+-- a point percent of the way along a lane, spawn to base
+local function PathPoint(points, percent)
+	local target = points[#points].distance_from_spawn * math.clamp(percent, 0, 100) / 100
+	for i = 2, #points do
+		local a, b = points[i - 1], points[i]
+		if b.distance_from_spawn >= target then
+			local span = math.max(b.distance_from_spawn - a.distance_from_spawn, 1e-6)
+			return a.position:Lerp(b.position, math.clamp((target - a.distance_from_spawn) / span, 0, 1))
+		end
+	end
+	return points[#points].position
+end
+
+-- a slot's anchor: its saved spot on this map, else Placement Distance % along the first lane
+local function PlaceAnchor(slot, unitId)
+	local cfg = State.Slots[tostring(slot)]
+	if cfg.Mode == "My position" then
+		local p = placePositions[tostring(MapKey()) .. "|" .. tostring(slot)]
+		if p then return Vector3.new(p[1], p[2], p[3]), "saved spot" end
+	end
+	local lane = Lanes()[1]
+	if not lane then return nil, "enemy path not loaded yet" end
+	local percent = IsFarm(unitId) and State.FarmPlaceDistance or State.PlaceDistance
+	return PathPoint(lane.points, percent), percent .. "% of the path"
+end
+
+-- ground the game takes for this unit at x, z: the game's own placement raycasts, off the road, 2.5 studs from any unit.
+-- Returns the ground point and the ray origin spawn_unit wants
+-- ponytail: tries origins 40 / 12 / 4 studs up instead of the game's see-through + path-ceiling walk; roofed maps may
+-- need that if spots keep getting refused
+local UNIT_GAP = 2.5
+local function SpotAt(data, x, refY, z, blockers)
+	local PC = Core.PlacementCore
+	if not PC._initialized then return nil end
+	local road = workspace:FindFirstChild("_road")
+	for _, up in { 40, 12, 4 } do
+		local origin = Vector3.new(x, refY + up, z)
+		local hit = PC.raycast(origin, Vector3.new(0, -120, 0))
+		if hit and PC.is_valid_raycast_hit(hit.Instance, data) and not hit.Instance:HasTag("blacklistobject") then
+			local check = PC.raycastCheck(origin, Vector3.new(0, -150, 0))
+			local inst = check and check.Instance
+			if inst and (inst:HasTag("blacklistobject") or (road and inst:IsDescendantOf(road)) or inst:IsDescendantOf(workspace._UNITS)) then
+				return nil
+			end
+			for _, p in blockers do
+				if Vector2.new(p.X - hit.Position.X, p.Z - hit.Position.Z).Magnitude < UNIT_GAP then return nil end
+			end
+			return hit.Position, origin
+		end
+	end
+end
+
+-- every placed unit, yours or a teammate's, plus reserved spots (holograms not placed yet)
+local function Blockers(reserved)
+	local blockers = table.clone(reserved or {})
+	for _, m in CS:GetTagged("player_units") do
+		if m:IsDescendantOf(workspace) then table.insert(blockers, m:GetPivot().Position) end
+	end
+	return blockers
+end
+
+-- the free spot nearest the anchor, in 1.5-stud rings out to 30 studs; bad = spots the server refused
+local function FindSpot(data, anchor, bad, reserved)
+	local blockers = Blockers(reserved)
+	for r = 0, 30, 1.5 do
+		local steps = r == 0 and 1 or math.max(8, math.floor(2 * math.pi * r / 1.5))
+		for k = 0, steps - 1 do
+			local a = 2 * math.pi * k / steps
+			local x, z = anchor.X + math.cos(a) * r, anchor.Z + math.sin(a) * r
+			local key = math.floor(x) .. "," .. math.floor(z)
+			if not bad[key] then
+				local spot, origin = SpotAt(data, x, anchor.Y, z, blockers)
+				if spot then return spot, origin, key end
+			end
+		end
+	end
+end
+
+local function Spawn(uuid, origin, rotation)
+	return Invoke("spawn_unit", uuid, { Origin = origin, Direction = Vector3.new(0, -1, 0) }, rotation or 0)
+end
+
+-- the model a spawn just made: your new copy of that collection unit
+local function NewUnit(uuid, before, timeout)
+	local t0 = os.clock()
+	repeat
+		for _, m in MyUnits() do
+			if m._stats.uuid.Value == uuid and not before[InstanceId(m)] then return m end
+		end
+		task.wait(0.2)
+	until os.clock() - t0 > (timeout or 3)
+end
+local function Snapshot()
+	local before = {}
+	for _, m in MyUnits() do before[InstanceId(m)] = true end
+	return before
+end
+
+--------------------------- [[ Holograms ]] ---------------------------
+
+-- AA's holograms: a see-through copy of each unit on the spot Auto Place will use next, in the order it will place
+-- them ("slot·copy"), and per slot a disc over its area with a pin on every free spot in it. On this client only;
+-- clones the game's stored unit template, so no unit setup script runs
+local HOLOGRAM_COLOR = Color3.fromRGB(132, 88, 240)
+local HOLOGRAM_STRIP = { "Decal", "Texture", "SurfaceAppearance", "Script", "LocalScript", "ModuleScript", "Humanoid",
+	"Sound", "ParticleEmitter", "Trail", "Beam", "BillboardGui", "Light" }
+local hologramFolder
+
+local function GhostPart(props)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+	p.Material, p.Color = Enum.Material.Neon, HOLOGRAM_COLOR
+	for k, v in props do p[k] = v end
+	return p
+end
+
+local function ClearHolograms()
+	if hologramFolder then hologramFolder:Destroy() end
+	hologramFolder = nil
+end
+
+local function Hologram(s, spot, copy, parent)
+	local template = (Core.UnitServiceCore.unit_chars or {})[s.u.unit_id]
+	local root = template and (template.PrimaryPart or template:FindFirstChild("HumanoidRootPart"))
+	local half = root and root.Size.Y / 2 or 1
+	local holo = template and template:Clone()
+	if holo then
+		for _, d in holo:GetDescendants() do
+			local strip = false
+			for _, class in HOLOGRAM_STRIP do
+				if d:IsA(class) then strip = true break end
+			end
+			if strip then
+				d:Destroy()
+			elseif d:IsA("BasePart") then
+				d.Anchored, d.CanCollide, d.CanQuery, d.CanTouch, d.CastShadow = true, false, false, false, false
+				d.Material, d.Color = Enum.Material.ForceField, HOLOGRAM_COLOR
+				if d:IsA("MeshPart") then pcall(function() d.TextureID = "" end) end
+			elseif d:IsA("SpecialMesh") then
+				d.TextureId = ""
+			end
+		end
+		holo:PivotTo(CFrame.lookAt(spot + Vector3.new(0, half, 0), Vector3.new(s.anchor.X, spot.Y + half, s.anchor.Z)))
+	else
+		holo = GhostPart({
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, 4, 4), Material = Enum.Material.ForceField,
+			CFrame = CFrame.new(spot + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		})
+	end
+	local tag = Instance.new("BillboardGui")
+	tag.Size, tag.StudsOffsetWorldSpace, tag.AlwaysOnTop = UDim2.fromOffset(34, 18), Vector3.new(0, 3, 0), true
+	tag.Adornee = holo:IsA("Model") and (holo.PrimaryPart or holo:FindFirstChildWhichIsA("BasePart")) or holo
+	tag.Parent = holo
+	local label = Instance.new("TextLabel")
+	label.Size, label.BackgroundTransparency, label.Text, label.TextScaled = UDim2.fromScale(1, 1), 1, s.slot .. "·" .. copy, true
+	label.Font, label.TextColor3, label.TextStrokeTransparency, label.Parent = Enum.Font.GothamBold, Color3.new(1, 1, 1), 0, tag
+	holo.Parent = parent
+end
+
+-- lays out holograms for every placement still to come (up to 36), picking slots the way Auto Place does
+local function BuildHolograms(slots, bad, full)
+	ClearHolograms()
+	local folder = Instance.new("Folder")
+	folder.Name, folder.Parent = "VaderHolograms", workspace
+	hologramFolder = folder
+	local counts, skip, reserved, spread = {}, {}, {}, {} -- spread: slot -> farthest planned spot from its point
+	for _, s in slots do counts[s.slot] = s.count end
+	for _ = 1, 36 do
+		if closed or hologramFolder ~= folder then return end
+		local pick
+		for _, s in slots do
+			if not full[s.uuid] and not skip[s.slot] and counts[s.slot] < s.cap then
+				local before = not pick or (State.FarmsFirst and s.farm and not pick.farm)
+					or ((not State.FarmsFirst or s.farm == pick.farm) and counts[s.slot] < counts[pick.slot])
+				if before then pick = s end
+			end
+		end
+		if not pick then break end
+		local spot = FindSpot(pick.data, pick.anchor, bad, reserved)
+		if spot then
+			table.insert(reserved, spot)
+			counts[pick.slot] += 1
+			Hologram(pick, spot, counts[pick.slot], folder)
+			spread[pick.slot] = math.max(spread[pick.slot] or 0, Vector2.new(spot.X - pick.anchor.X, spot.Z - pick.anchor.Z).Magnitude)
+		else
+			skip[pick.slot] = true
+		end
+		task.wait() -- one spot search a frame, so a rebuild doesn't hitch the game
+	end
+	local units, blockers = MyUnits(), Blockers(reserved)
+	for _, s in slots do
+		if closed or hologramFolder ~= folder then return end
+		local radius = spread[s.slot] or 0
+		for _, m in units do
+			if m._stats.uuid.Value == s.uuid then
+				local p = m:GetPivot().Position
+				radius = math.max(radius, Vector2.new(p.X - s.anchor.X, p.Z - s.anchor.Z).Magnitude)
+			end
+		end
+		-- ponytail: 6-15 studs with pins 3 apart keeps it to ~80 ground checks a slot (AA's limit, wider lagged)
+		radius = math.clamp(radius + 3, 6, 15)
+		local ground = Core.PlacementCore.raycast(s.anchor + Vector3.new(0, 40, 0), Vector3.new(0, -120, 0))
+		GhostPart({
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, radius * 2, radius * 2), Transparency = 0.8, Parent = folder,
+			CFrame = CFrame.new(Vector3.new(s.anchor.X, (ground and ground.Position.Y or s.anchor.Y) + 0.1, s.anchor.Z)) * CFrame.Angles(0, 0, math.pi / 2),
+		})
+		for dx = -radius, radius, 3 do
+			for dz = -radius, radius, 3 do
+				local spot = dx * dx + dz * dz <= radius * radius and SpotAt(s.data, s.anchor.X + dx, s.anchor.Y, s.anchor.Z + dz, blockers)
+				if spot then
+					GhostPart({
+						Shape = Enum.PartType.Cylinder, Size = Vector3.new(1.2, 0.4, 0.4), Color = Color3.new(1, 1, 1), Transparency = 0.3,
+						CFrame = CFrame.new(spot + Vector3.new(0, 0.6, 0)) * CFrame.Angles(0, 0, math.pi / 2), Parent = folder,
+					})
+				end
+			end
+		end
+		task.wait()
+	end
+end
+
+--------------------------- [[ Auto Play Tab ]] ---------------------------
+
+local PlaceBox = Box(Tabs.AutoPlay, "Auto Place", 1)
+local PlaceStatus = Status(PlaceBox, "Status", IS_LOBBY and "In the lobby." or "Waiting...")
+Toggle(PlaceBox, State, "AutoPlace", "Auto Place", "Places each slot around its point. Paused while Play Macro runs.")
+Toggle(PlaceBox, State, "FarmsFirst", "Farms First", "Money units first.")
+Slider(PlaceBox, State, "PlaceDistance", "Placement Distance %", 0, 100, "0 = enemy spawn, 100 = your base.")
+Slider(PlaceBox, State, "FarmPlaceDistance", "Farm Placement Distance %", 0, 100, "Same, for money units.")
+Toggle(PlaceBox, State, "ShowPlacePoint", "Show Placement Points", "Ball at each slot's point.")
+Toggle(PlaceBox, State, "ShowHolograms", "Show Holograms", "Planned spots, each slot's area and its free spots.", function(on)
+	if not on then ClearHolograms() end
+end)
+
+local function SetSlotPosition(slot)
+	local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+	if IS_LOBBY or not MapKey() or not root then return Notify("Stand on the spot in a match first.") end
+	placePositions[MapKey() .. "|" .. slot] = { root.Position.X, root.Position.Y, root.Position.Z }
+	WriteJson(SPOTS, placePositions)
+	State.Slots[slot].Mode = "My position"
+	Save()
+	Notify("Saved slot " .. slot .. "'s spot for " .. MapKey() .. " (Place Around: My position)")
+end
+
+local equippedNames = {}
+for i, slot in SLOTS do
+	slot = tostring(slot)
+	local cfg = State.Slots[slot]
+	local u = Owned(SlotUuid(slot))
+	local data = u and Data.Units[u.unit_id]
+	if u then table.insert(equippedNames, UnitName(u.unit_id)) end
+	local box = Box(Tabs.AutoPlay, "Slot " .. slot .. " - " .. (u and UnitName(u.unit_id) or "empty"), i % 2 + 1)
+	Toggle(box, cfg, "On", "Place This Slot")
+	Dropdown(box, cfg, "Mode", "Place Around", { "Enemy path", "My position" })
+	Slider(box, cfg, "Max", "Max Placed", 1, 20, data and data.spawn_cap and ("Game cap: " .. data.spawn_cap) or nil)
+	Button(box, "Set Position Here", "Saves where you stand for this map.", function() SetSlotPosition(slot) end)
+end
+
+local UpgradeBox = Box(Tabs.AutoPlay, "Upgrade", 1)
+Toggle(UpgradeBox, State, "AutoUpgrade", "Auto Upgrade", "Waits for Play Macro to finish.")
+Slider(UpgradeBox, State, "UpgradeUntil", "Upgrade Until", 1, 15, "Stops at this upgrade (or the unit's max).")
+Dropdown(UpgradeBox, State, "UpgradeOrder", "Upgrade Order", { "Cheapest first", "Farms first", "Strongest first", "Smart" },
+	"For units not ticked in Upgrade Priority. Smart (Farmer's): farms cheapest first, then the strongest damage unit you can afford, buff units last.")
+Toggle(UpgradeBox, State, "PlaceBeforeUpgrade", "Place Before Upgrading", "Upgrades wait for Auto Place.")
+
+-- Upgrade Priority, AA's list: a ticked unit takes every upgrade before the rest (saving up for it), top row first.
+-- The box ticks it, the arrows move it. Your team at hub load, by name
+local function ThemeColor(path, fallback)
+	local ok, v = pcall(function()
+		local t = Starlight.CurrentTheme
+		for part in path:gmatch("[^%.]+") do t = t[part] end
+		return t
+	end)
+	if ok and typeof(v) == "ColorSequence" then return v.Keypoints[1].Value end
+	return ok and typeof(v) == "Color3" and v or fallback
+end
+do
+	-- keep the saved order, drop names no longer on the team, add new ones unticked at the bottom
+	local merged, seen = {}, {}
+	for _, e in type(State.UpgradePriority) == "table" and State.UpgradePriority or {} do
+		if type(e) == "table" and table.find(equippedNames, e.id) and not seen[e.id] then
+			seen[e.id] = true
+			table.insert(merged, { id = e.id, on = e.on == true })
+		end
+	end
+	for _, name in equippedNames do
+		if not seen[name] then
+			seen[name] = true
+			table.insert(merged, { id = name, on = false })
+		end
+	end
+	State.UpgradePriority = merged
+
+	local box = Box(Tabs.AutoPlay, "Upgrade Priority", 2)
+	local p = box:CreateParagraph({ Name = "Upgrade Priority", Content = "Ticked = maxed first, top row first. The rest follow Upgrade Order." }, Id("Paragraph"))
+	local list
+	local function render()
+		if not list then return end
+		Elevate()
+		local field, text = ThemeColor("Backgrounds.Light", Color3.fromRGB(33, 34, 38)), ThemeColor("Foregrounds.Light", Color3.new(1, 1, 1))
+		local sub, off = ThemeColor("Foregrounds.Medium", Color3.fromRGB(165, 165, 165)), ThemeColor("Foregrounds.Dark", Color3.fromRGB(65, 69, 77))
+		local accent = ThemeColor("Accents.Main", Color3.fromRGB(161, 169, 225))
+		for _, child in list:GetChildren() do
+			if child:IsA("Frame") then child:Destroy() end
+		end
+		for rank, entry in merged do
+			local line = Instance.new("Frame")
+			line.Size, line.BackgroundColor3, line.BorderSizePixel, line.LayoutOrder = UDim2.new(1, 0, 0, 26), field, 0, rank
+			Instance.new("UICorner", line).CornerRadius = UDim.new(0, 6)
+			local tick = Instance.new("TextButton")
+			tick.Text, tick.AutoButtonColor, tick.BorderSizePixel, tick.AnchorPoint = "", false, 0, Vector2.new(0, 0.5)
+			tick.Position, tick.Size, tick.BackgroundColor3 = UDim2.new(0, 5, 0.5, 0), UDim2.fromOffset(16, 16), entry.on and accent or off
+			Instance.new("UICorner", tick).CornerRadius = UDim.new(0, 4)
+			tick.Parent = line
+			tick.MouseButton1Click:Connect(function()
+				entry.on = not entry.on
+				Save()
+				render()
+			end)
+			local label = Instance.new("TextLabel")
+			label.BackgroundTransparency, label.Position, label.Size = 1, UDim2.fromOffset(28, 0), UDim2.new(1, -80, 1, 0)
+			label.Font, label.TextSize, label.TextXAlignment = Enum.Font.Gotham, 12, Enum.TextXAlignment.Left
+			label.TextTruncate, label.TextColor3 = Enum.TextTruncate.AtEnd, entry.on and text or sub
+			label.Text = rank .. ". " .. entry.id
+			label.Parent = line
+			for i, step in { -1, 1 } do
+				local arrow = Instance.new("ImageButton")
+				arrow.BackgroundTransparency, arrow.AnchorPoint = 1, Vector2.new(1, 0.5)
+				arrow.Position, arrow.Size = UDim2.new(1, i == 1 and -28 or -4, 0.5, 0), UDim2.fromOffset(20, 20)
+				arrow.Image, arrow.Rotation, arrow.ImageColor3 = "rbxassetid://10709790948", step < 0 and 180 or 0, sub
+				arrow.Parent = line
+				arrow.MouseButton1Click:Connect(function()
+					local other = merged[rank + step]
+					if other then
+						merged[rank], merged[rank + step] = other, entry
+						Save()
+						render()
+					end
+				end)
+			end
+			line.Parent = list
+		end
+	end
+	-- Starlight builds the paragraph a moment later; the list goes right under it
+	task.spawn(function()
+		local t0 = os.clock()
+		while not p.Instance and os.clock() - t0 < 10 do task.wait() end
+		if not p.Instance or closed then return end
+		Elevate()
+		list = Instance.new("Frame")
+		list.Name, list.BackgroundTransparency, list.LayoutOrder = "PRIORITY_LIST", 1, 1
+		list.Size, list.AutomaticSize = UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
+		local layout = Instance.new("UIListLayout")
+		layout.Padding, layout.SortOrder, layout.Parent = UDim.new(0, 4), Enum.SortOrder.LayoutOrder, list
+		list.Parent = p.Instance.Parent
+		render()
+		local theme = Starlight.CurrentTheme
+		while not closed and list.Parent do -- recolor when the theme changes
+			task.wait(2)
+			if Starlight.CurrentTheme ~= theme then
+				theme = Starlight.CurrentTheme
+				render()
+			end
+		end
+	end)
+end
+
+local AbilityBox = Box(Tabs.AutoPlay, "Abilities", 2)
+Toggle(AbilityBox, State, "AutoAbility", "Auto Use Abilities", "Casts every ready ability.")
+Dropdown(AbilityBox, State, "AbilityIgnore", "Ignore Units", equippedNames, "Units whose ability needs you to pick something.", nil, true)
+
+--------------------------- [[ Macro ]] ---------------------------
+
+-- steps: spawn { unit_id, origin, dir, rot, wave } | upgrade { unit, to } | sell { unit, wave } | ability { unit, slot, wave };
+-- unit = the index of the spawn step that placed it
+local MACRO_ACTIONS = { spawn_unit = "spawn", upgrade_unit_ingame = "upgrade", sell_unit_ingame = "sell", use_active_attack = "ability" }
+local MACRO_MODES = { "Story", "Legend", "Raid", "Infinite", "Challenge", "Other" }
+local recording, recordTarget = nil, nil
+local recordStep = {} -- placed copy id -> its spawn step, while recording
+local MacroStatus
+
+local function V(t) return Vector3.new(t[1], t[2], t[3]) end
+local function T(v) return { v.X, v.Y, v.Z } end
+local function CleanName(name) return (tostring(name or ""):gsub("[^%w_%- ]", ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+local function MacroPath(name) return MACROS .. "/" .. name .. ".json" end
+local function ListMacros()
+	local names = {}
+	if canFile and type(listfiles) == "function" then
+		for _, path in listfiles(MACROS) do
+			local name = path:match("([^/\\]+)%.json$")
+			if name then table.insert(names, name) end
+		end
+	end
+	table.sort(names)
+	return names
+end
+local function LoadMacro(name) return name and ReadJson(MacroPath(name), {}).steps or {} end
+local function SaveMacro(name, steps) WriteJson(MacroPath(name), { steps = steps }) end
+local function Summary(steps)
+	local c = { spawn = 0, upgrade = 0, sell = 0, ability = 0 }
+	for _, s in steps do c[s.type] = (c[s.type] or 0) + 1 end
+	return string.format("%d steps: %d spawn, %d upgrade, %d sell, %d ability", #steps, c.spawn, c.upgrade, c.sell, c.ability)
+end
+local function ActiveMacroName()
+	if State.AutoSwitchMacro then
+		local mode = CurrentMode()
+		local name = mode and (assignments[mode .. "|" .. tostring(MapKey())] or assignments[mode .. "|Any map"])
+		if name then return name end
+	end
+	return State.MacroName
+end
+
+-- stands in for the game's EndpointsClient.invoke_server: your clicks and the hub's own actions both land in a recording
+local function RecordingInvoke(name, ...)
+	local action = State.RecordMacro and MACRO_ACTIONS[name]
+	if not action then return origInvoke(name, ...) end
+	if not recording then
+		recording, recordTarget = {}, nil
+		table.clear(recordStep)
+	end
+	local args = table.pack(...)
+	local before = action == "spawn" and Snapshot()
+	local unitStep = action ~= "spawn" and recordStep[args[1]] -- resolve first: a sold unit is gone afterwards
+	local result = table.pack(origInvoke(name, ...))
+	local step
+	if action == "spawn" and result[1] then
+		local u, ray = Owned(args[1]), args[2]
+		if u and type(ray) == "table" and typeof(ray.Origin) == "Vector3" then
+			step = { type = "spawn", wave = Wave(), unit_id = u.unit_id, origin = T(ray.Origin), dir = T(ray.Direction), rot = tonumber(args[3]) or 0 }
+			table.insert(recording, step)
+			local index, rec = #recording, recording
+			task.spawn(function()
+				local m = NewUnit(args[1], before, 3)
+				if m and rec == recording then recordStep[InstanceId(m)] = index end
+			end)
+		end
+	elseif unitStep and (result[1] or action ~= "upgrade") then
+		step = { type = action, wave = Wave(), unit = unitStep }
+		if action == "upgrade" then step.to = tonumber(args[3]) end
+		if action == "ability" then step.slot = tonumber(args[3]) end
+		table.insert(recording, step)
+	end
+	if step then
+		local isNew = not recordTarget
+		recordTarget = recordTarget or ActiveMacroName() or CleanName((CurrentMode() or "Macro") .. "_" .. tostring(MapKey()))
+		SaveMacro(recordTarget, recording)
+		if MacroStatus then MacroStatus("Recording into " .. recordTarget .. " - " .. Summary(recording)) end
+		if isNew and Env.ACXRefreshMacros then task.spawn(Env.ACXRefreshMacros) end
+	end
+	return table.unpack(result, 1, result.n)
+end
+EP.invoke_server = RecordingInvoke
+
+--------------------------- [[ Macro Tab ]] ---------------------------
+
+local MacroBox = Box(Tabs.Macro, "Macro", 1)
+MacroStatus = Status(MacroBox, "Status", IS_LOBBY and "In the lobby." or "Waiting for the match...")
+local macroDropdown = Dropdown(MacroBox, State, "MacroName", "Macro", ListMacros(), "Auto Switch overrides this.")
+local recordToggle = Toggle(MacroBox, State, "RecordMacro", "Record Macro",
+	"Records your spawns, upgrades, sells and abilities until the match ends. Into the picked macro, or a new Mode_map one.",
+	function(v)
+		recording, recordTarget = nil, nil -- the next recorded action starts a fresh one
+		if v then MacroStatus("Recording - your next action starts the macro.") end
+	end)
+Toggle(MacroBox, State, "PlayMacro", "Play Macro", "Waits for money and waves.")
+Toggle(MacroBox, State, "MacroSlotSpots", "Place At Auto Play Points", "Spawns around each slot's Auto Play point instead of the recorded spot.")
+
+local ManageBox = Box(Tabs.Macro, "Manage", 2)
+local typedName = Input(ManageBox, "Name", "macro name")
+local function RefreshMacros()
+	local names = ListMacros()
+	if State.MacroName and not table.find(names, State.MacroName) then State.MacroName = nil end
+	SetOptions(macroDropdown, names, State.MacroName)
+	if Env.ACXRefreshAssign then Env.ACXRefreshAssign(names) end
+end
+Env.ACXRefreshMacros = RefreshMacros
+local function TypedName()
+	local name = CleanName(typedName())
+	if name == "" then Notify("Type a name first (letters, numbers, space, _ and -).") return nil end
+	if canFile and isfile(MacroPath(name)) then Notify(name .. " already exists.") return nil end
+	return name
+end
+Button(ManageBox, "Create Macro", nil, function()
+	local name = TypedName()
+	if not name then return end
+	SaveMacro(name, {})
+	State.MacroName = name
+	Save()
+	RefreshMacros()
+	Notify("Created " .. name)
+end)
+Button(ManageBox, "Rename Selected Macro", "Assignments follow it.", function()
+	local old = State.MacroName
+	if not old then return Notify("Pick a macro to rename.") end
+	local name = TypedName()
+	if not name then return end
+	writefile(MacroPath(name), readfile(MacroPath(old)))
+	if type(delfile) == "function" then delfile(MacroPath(old)) end
+	for key, assigned in assignments do
+		if assigned == old then assignments[key] = name end
+	end
+	WriteJson(ASSIGN, assignments)
+	State.MacroName = name
+	Save()
+	RefreshMacros()
+	Notify("Renamed " .. old .. " to " .. name)
+end)
+local deleteArmed
+Button(ManageBox, "Delete Selected Macro", "Press twice within 5s.", function()
+	local name = State.MacroName
+	if not name then return Notify("Pick a macro to delete.") end
+	if deleteArmed ~= name then
+		deleteArmed = name
+		task.delay(5, function() if deleteArmed == name then deleteArmed = nil end end)
+		return Notify("Press again to delete " .. name .. " and its assignments.")
+	end
+	deleteArmed = nil
+	if type(delfile) == "function" then delfile(MacroPath(name)) end
+	for key, assigned in assignments do
+		if assigned == name then assignments[key] = nil end
+	end
+	WriteJson(ASSIGN, assignments)
+	RefreshMacros()
+	Notify("Deleted " .. name)
+end)
+
+local ShareBox = Box(Tabs.Macro, "Share", 1)
+local typedLink = Input(ShareBox, "Link Or JSON", "https://...json or pasted macro JSON")
+Button(ShareBox, "Install Macro", "Saved under Name, or its own name.", function()
+	local text = (typedLink():gsub("^%s+", ""):gsub("%s+$", ""))
+	local isLink = text:match("^https?://") ~= nil
+	if not isLink and text:sub(1, 1) ~= "{" then return Notify("Paste a link that starts with https:// or a macro's JSON.") end
+	local body = text
+	if isLink then
+		local ok, result = pcall(game.HttpGet, game, text)
+		if not ok then return Notify("Download failed: " .. tostring(result)) end
+		body = result
+	end
+	local ok, data = pcall(Http.JSONDecode, Http, body)
+	if not ok or type(data) ~= "table" or type(data.steps) ~= "table" then return Notify("That isn't a macro.") end
+	local name = CleanName(typedName())
+	if name == "" then name = CleanName(data.name or (isLink and text:match("([^/?#]+)%.json"))) end
+	if name == "" then name = "Macro" end
+	SaveMacro(name, data.steps)
+	State.MacroName = name
+	Save()
+	RefreshMacros()
+	Notify("Installed " .. name .. " - " .. Summary(data.steps))
+end)
+Button(ShareBox, "Export Selected Macro", "Copies its JSON.", function()
+	local name = State.MacroName
+	if not name then return Notify("Pick a macro to export.") end
+	local copy = setclipboard or toclipboard
+	local steps = LoadMacro(name)
+	if type(copy) ~= "function" or not pcall(copy, Http:JSONEncode({ name = name, steps = steps })) then
+		return Notify("Couldn't copy to the clipboard.")
+	end
+	Notify("Copied " .. name .. " - " .. Summary(steps))
+end)
+
+local SwitchBox = Box(Tabs.Macro, "Auto Switch", 2)
+local AssignList = Status(SwitchBox, "Assignments", "-")
+local function RefreshAssignList()
+	local lines = {}
+	for key, name in assignments do
+		local mode, map = key:match("^(.-)|(.*)$")
+		table.insert(lines, string.format("%s | %s -> %s", mode, map, name))
+	end
+	table.sort(lines)
+	AssignList(#lines > 0 and table.concat(lines, "\n") or "None yet.")
+end
+RefreshAssignList()
+Toggle(SwitchBox, State, "AutoSwitchMacro", "Switch Macro By Mode & Map")
+local pick = { Mode = "Story", Map = "Any map", Macro = nil }
+local modeDropdown = Dropdown(SwitchBox, pick, "Mode", "Game Mode", MACRO_MODES)
+local mapDropdown = Dropdown(SwitchBox, pick, "Map", "Map", mapLabels)
+local assignDropdown = Dropdown(SwitchBox, pick, "Macro", "Macro", ListMacros())
+Env.ACXRefreshAssign = function(names) SetOptions(assignDropdown, names, pick.Macro) end
+local function AssignKey()
+	local map = pick.Map == "Any map" and "Any map" or (pick.Map:match("%[(.-)%]$") or pick.Map)
+	return pick.Mode .. "|" .. map
+end
+Button(SwitchBox, "Use Current Match", nil, function()
+	if not CurrentMode() then return Notify("Join a match first.") end
+	pick.Mode = CurrentMode()
+	SetOptions(modeDropdown, MACRO_MODES, pick.Mode)
+	for _, label in mapLabels do
+		if label:match("%[(.-)%]$") == MapKey() then
+			pick.Map = label
+			SetOptions(mapDropdown, mapLabels, label)
+		end
+	end
+end)
+Button(SwitchBox, "Assign", nil, function()
+	if not pick.Macro then return Notify("Pick a macro to assign.") end
+	assignments[AssignKey()] = pick.Macro
+	WriteJson(ASSIGN, assignments)
+	RefreshAssignList()
+	Notify(AssignKey() .. " -> " .. pick.Macro)
+end)
+Button(SwitchBox, "Remove Assignment", nil, function()
+	assignments[AssignKey()] = nil
+	WriteJson(ASSIGN, assignments)
+	RefreshAssignList()
+end)
+
+--------------------------- [[ Summon Tab ]] ---------------------------
+
+local banners = {}
+for id, b in Data.Banners do
+	if b.active then table.insert(banners, id) end
+end
+table.sort(banners)
+local SummonBox = Box(Tabs.Summon, "Summon", 1)
+local SummonStatus = Status(SummonBox, "Status", "Gems: " .. Gems())
+Dropdown(SummonBox, State, "Banner", "Banner", banners)
+Dropdown(SummonBox, State, "SummonAmount", "Amount", { "x1", "x10" })
+Slider(SummonBox, State, "KeepGems", "Keep Gems", 0, 50000, "Auto Summon stops above this.")
+Toggle(SummonBox, State, "AutoSummon", "Auto Summon", "Lobby only.")
+local function SummonOnce()
+	local b = State.Banner and Data.Banners[State.Banner]
+	if not b then return false, "Pick a banner first." end
+	local ten = State.SummonAmount == "x10"
+	local cost = (b.gem_cost or 50) * (ten and 10 or 1)
+	if Gems() - cost < State.KeepGems then return false, "Not enough gems above Keep Gems." end
+	Invoke("buy_from_banner", State.Banner, ten and "gems10" or "gems")
+	return true, "Summoned " .. State.SummonAmount .. " on " .. State.Banner
+end
+Button(SummonBox, "Summon Now", nil, function()
+	if not IS_LOBBY then return Notify("Summon in the lobby.") end
+	local _, why = SummonOnce()
+	Notify(why)
+end)
+
+--------------------------- [[ Rewards Tab ]] ---------------------------
+
+local function RedeemCodes()
+	local r = Invoke("get_codes")
+	local got = 0
+	for _, c in type(r) == "table" and r.codes or {} do
+		if not c.redeemed and not c.locked and (r.level or 0) >= (c.min_level or 0) then
+			local ok, done = pcall(Client.CodesServiceClient.redeem, c.code)
+			if ok and done then got += 1 end
+			task.wait(2)
+		end
+	end
+	return got
+end
+local function ClaimDaily()
+	local ok, statuses = pcall(Client.DailyRewardsServiceClient.statuses)
+	local got = 0
+	for id, st in ok and type(statuses) == "table" and statuses or {} do
+		if type(st) == "table" and st.ready and select(2, pcall(Client.DailyRewardsServiceClient.claim, id)) then got += 1 end
+	end
+	return got
+end
+local RewardsBox = Box(Tabs.Rewards, "Auto Claim", 1)
+Toggle(RewardsBox, State, "AutoCodes", "Auto Redeem Codes")
+Toggle(RewardsBox, State, "AutoQuests", "Auto Claim Quests")
+Toggle(RewardsBox, State, "AutoDaily", "Auto Claim Login Rewards")
+Toggle(RewardsBox, State, "AutoBattlePass", "Auto Claim Battle Pass")
+local NowBox = Box(Tabs.Rewards, "Claim Now", 2)
+Button(NowBox, "Redeem Codes", nil, function() Notify("Redeemed " .. RedeemCodes() .. " codes") end)
+Button(NowBox, "Claim Quests", nil, function() pcall(Client.QuestServiceClient.claim_all) Notify("Claimed quests") end)
+Button(NowBox, "Claim Login Rewards", nil, function() Notify("Claimed " .. ClaimDaily() .. " login rewards") end)
+Button(NowBox, "Claim Battle Pass", nil, function() Invoke("claim_battlepass_rewards") Notify("Claimed battle pass") end)
+
+--------------------------- [[ Settings Tab ]] ---------------------------
+
+local SettingsBox = Box(Tabs.Settings, "Settings", 1)
+Toggle(SettingsBox, State, "AntiAfk", "Anti-AFK")
+SettingsBox:CreateParagraph({ Name = "Toggle UI", Content = "Right Ctrl" }, Id("Paragraph"))
+Button(SettingsBox, "Unload Hub", nil, function() Env.ACXHub.Unload() end)
+pcall(Tabs.Settings.BuildThemeGroupbox, Tabs.Settings, 2) -- Starlight's theme picker and editor, saved by Starlight
+task.delay(1, function() pcall(Starlight.LoadAutoloadTheme, Starlight) end)
+
+--------------------------- [[ Loops: Lobby ]] ---------------------------
+
+if IS_LOBBY then
+	task.spawn(function()
+		while not closed do
+			task.wait(3)
+			if State.AutoJoin and not LP:HasTag("Teleporting") then
+				Elevate()
+				if TeleportDelay("Joining", function() return State.AutoJoin end) then
+					local ok, why = JoinNow()
+					JoinStatus(why)
+					task.wait(ok and 20 or 10)
+				end
+			elseif not State.AutoJoin then
+				JoinStatus("Auto Join is off.")
+			end
+		end
+	end)
+	task.spawn(function()
+		while not closed do
+			task.wait(3)
+			SummonStatus("Gems: " .. Gems())
+			if State.AutoSummon and State.Banner then
+				local ok, why = SummonOnce()
+				if not ok then SummonStatus("Gems: " .. Gems() .. " - " .. why) end
+			end
+		end
+	end)
+	task.spawn(function()
+		task.wait(5)
+		while not closed do
+			if State.AutoCodes then pcall(RedeemCodes) end
+			if State.AutoQuests then pcall(Client.QuestServiceClient.claim_all) end
+			if State.AutoDaily then pcall(ClaimDaily) end
+			if State.AutoBattlePass then Invoke("claim_battlepass_rewards") end
+			task.wait(300)
+		end
+	end)
+end
+
+--------------------------- [[ Loops: Match ]] ---------------------------
+
+local placePending, macroPending = false, false
+local markers = {} -- slot -> placement point ball
+
+if not IS_LOBBY then
+	local gameData = workspace._DATA
+	local soldThisMatch, leaving = false, false
+	-- Replay restarts the match in this same server (game_restarted): every loop resets its per-match state on it
+	local matchNo = 1
+	Track(fromServer.game_restarted.OnClientEvent:Connect(function()
+		matchNo += 1
+		soldThisMatch, leaving = false, false
+	end))
+
+	-- wave skip vote: the event's arguments are packed, but only its arrival matters
+	Track(fromServer.start_vote_wave_skip.OnClientEvent:Connect(function()
+		if State.AutoSkip then task.spawn(Invoke, "vote_wave_skip") end
+	end))
+
+	Track(workspace._wave_num.Changed:Connect(function(wave)
+		MatchStatus("Wave " .. tostring(wave) .. "  |  Money " .. tostring(Money()))
+		if State.AutoSell and not soldThisMatch and wave >= State.SellWave then
+			soldThisMatch = true
+			for _, m in MyUnits() do Invoke("sell_unit_ingame", InstanceId(m)) end
+			Notify("Sold all units at wave " .. wave)
+		end
+		if State.LobbyAtWave and not leaving and wave >= State.LobbyWave then
+			leaving = true
+			task.spawn(function()
+				if TeleportDelay("Back to the lobby at wave " .. wave, function() return State.LobbyAtWave end) then
+					Invoke("teleport_back_to_lobby")
+				else
+					leaving = false
+				end
+			end)
+		end
+	end))
+
+	-- match end: Replay / Next Stage / Lobby, the votes the results screen sends
+	local function NextVote(victory)
+		local d = Loader.LevelData
+		local w = Data.Worlds[d.world]
+		if victory and w and w.legend_stage then return "next_legend" end
+		if victory and d._is_actual_storymode then return "next_story" end
+		if victory and d._gamemode == "raid" then return "next_raid" end
+		return "replay"
+	end
+	local Compress = Loader.load_core_class(script, "Compress")
+	Track(fromServer.game_finished.OnClientEvent:Connect(function(...)
+		local ok, results = pcall(Compress.DecodePacket, ...)
+		local victory = ok and type(results) == "table" and results.victory == true
+		-- a recording ends with its match, so a replay doesn't record over it
+		if State.RecordMacro then
+			Elevate()
+			if recordTarget then Notify("Saved " .. recordTarget .. " - " .. Summary(recording)) end
+			State.RecordMacro, recording, recordTarget = false, nil, nil
+			pcall(recordToggle.Set, recordToggle, { CurrentValue = false })
+		end
+		task.delay(3, function()
+			local action = State.EndAction
+			if closed or action == "Nothing" then return end
+			if not TeleportDelay(action, function() return State.EndAction == action end) then return end
+			if action == "Replay" then
+				Invoke("set_game_finished_vote", Loader.LevelData._gamemode == "infinite_tower" and "next_infinite_tower" or "replay")
+			elseif action == "Next Stage" then
+				Invoke("set_game_finished_vote", NextVote(victory))
+			elseif action == "Lobby" then
+				Invoke("teleport_back_to_lobby")
+			end
+		end)
+	end))
+
+	-- start vote after a countdown, leaving time to place or cancel
+	task.spawn(function()
+		local countdown, lastVote, seen = nil, 0, matchNo
+		while not closed do
+			if seen ~= matchNo then seen, countdown, lastVote = matchNo, nil, 0 end
+			if gameData.GameStarted.Value or not State.AutoStart then
+				countdown = nil
+			else
+				countdown = countdown or State.StartDelay
+				if countdown > 0 then
+					MatchStatus("Auto start in " .. countdown .. "s")
+					countdown -= 1
+				elseif os.clock() - lastVote > 10 then
+					lastVote = os.clock()
+					MatchStatus("Voted to start")
+					Invoke("vote_start")
+				end
+			end
+			task.wait(1)
+		end
+	end)
+
+	-- Auto Place: one placement a second, the slot with the fewest copies down first
+	task.spawn(function()
+		local bad, refusals, full = {}, {}, {} -- refused spots, refusals in a row per unit, units at their limit
+		local hologramKey, lastSpots -- what the holograms were laid out for; every slot's point last tick
+		local seen = matchNo
+		while not closed do
+			task.wait(1)
+			Elevate()
+			if seen ~= matchNo then seen, bad, refusals, full, hologramKey = matchNo, {}, {}, {}, nil end
+			local ok, problem = pcall(function()
+				local placed = {}
+				for _, m in MyUnits() do
+					local id = m._stats.uuid.Value
+					placed[id] = (placed[id] or 0) + 1
+				end
+				local pickSlot, lines, slots = nil, {}, {}
+				for _, slotN in SLOTS do
+					local slot = tostring(slotN)
+					local cfg = State.Slots[slot]
+					local uuid = SlotUuid(slot)
+					local u = Owned(uuid)
+					local data = u and Data.Units[u.unit_id]
+					local anchor, where
+					if data and cfg.On then anchor, where = PlaceAnchor(slot, u.unit_id) end
+
+					if anchor and State.ShowPlacePoint then
+						if not markers[slot] then
+							markers[slot] = Instance.new("Part")
+							markers[slot].Shape, markers[slot].Size, markers[slot].Anchored = Enum.PartType.Ball, Vector3.new(2, 2, 2), true
+							markers[slot].CanCollide, markers[slot].CanQuery, markers[slot].CanTouch = false, false, false
+							markers[slot].Material, markers[slot].Color, markers[slot].Transparency = Enum.Material.Neon, Color3.fromHSV((slotN - 1) / 6, 0.8, 1), 0.3
+							markers[slot].Name, markers[slot].Parent = "VaderPlacePoint" .. slot, workspace
+						end
+						markers[slot].Position = anchor + Vector3.new(0, 1, 0)
+					elseif markers[slot] then
+						markers[slot]:Destroy()
+						markers[slot] = nil
+					end
+
+					if data and cfg.On then
+						local count, cap = placed[uuid] or 0, math.min(cfg.Max, data.spawn_cap or cfg.Max)
+						local farm = IsFarm(u.unit_id)
+						table.insert(lines, string.format("%s %s: %d/%d%s", slot, UnitName(u.unit_id), count, cap, anchor and (" at " .. where) or (" - " .. where)))
+						if anchor then
+							table.insert(slots, { slot = slot, uuid = uuid, u = u, data = data, count = count, cap = cap, anchor = anchor, farm = farm })
+						end
+						local before = not pickSlot or (State.FarmsFirst and farm and not pickSlot.farm)
+							or ((not State.FarmsFirst or farm == pickSlot.farm) and count < pickSlot.count)
+						if anchor and not full[uuid] and count < cap and before then
+							pickSlot = { slot = slot, uuid = uuid, u = u, data = data, count = count, anchor = anchor, farm = farm }
+						end
+					end
+				end
+
+				placePending = State.AutoPlace and not State.PlayMacro and pickSlot ~= nil
+				local note
+				if not State.AutoPlace then
+					note = "Auto Place is off."
+				elseif State.PlayMacro then
+					note = "Paused while Play Macro is on."
+				elseif not pickSlot then
+					note = "Every slot that's on is placed."
+				else
+					local name = "slot " .. pickSlot.slot .. " " .. UnitName(pickSlot.u.unit_id)
+					local cost = SpawnCost(pickSlot.u.unit_id)
+					local okc, cooling = pcall(function() return session.collection:is_unit_on_cooldown(pickSlot.uuid) end)
+					if Money() < cost then
+						note = string.format("Next: %s - waiting for %d¥", name, cost)
+					elseif okc and cooling then
+						note = "Next: " .. name .. " - on cooldown"
+					else
+						local _, origin, key = FindSpot(pickSlot.data, pickSlot.anchor, bad)
+						if not origin then
+							full[pickSlot.uuid] = true
+							note = "No free spot for " .. name .. " within 30 studs of its point - skipping it."
+						elseif Spawn(pickSlot.uuid, origin) then
+							refusals[pickSlot.uuid] = 0
+							note = string.format("Placed %s #%d", name, pickSlot.count + 1)
+						else
+							bad[key] = true
+							refusals[pickSlot.uuid] = (refusals[pickSlot.uuid] or 0) + 1
+							if refusals[pickSlot.uuid] >= 5 then full[pickSlot.uuid] = true end -- the server's limit
+							note = string.format("%s was refused at a spot (%d/5)", name, refusals[pickSlot.uuid])
+						end
+					end
+				end
+				PlaceStatus(note .. (#lines > 0 and ("\n" .. table.concat(lines, "\n")) or ""))
+
+				-- holograms: rebuilt when what's placed, refused or planned changes; while a point moves (a distance
+				-- slider being dragged) they clear and wait for it to settle
+				if State.ShowHolograms then
+					local key, spots, refused = { #CS:GetTagged("player_units"), State.FarmsFirst and "F" or "" }, {}, 0
+					for _ in bad do refused += 1 end
+					for _, s in slots do
+						table.insert(key, string.format("%s:%d/%d%s", s.slot, s.count, s.cap, full[s.uuid] and "F" or ""))
+						table.insert(spots, string.format("%.0f,%.0f", s.anchor.X, s.anchor.Z))
+					end
+					key = table.concat(key, "|") .. "#" .. refused
+					spots = table.concat(spots, "|")
+					if spots ~= lastSpots then
+						lastSpots = spots
+						if hologramKey then
+							hologramKey = nil
+							ClearHolograms()
+						end
+					elseif key ~= hologramKey then
+						hologramKey = key
+						BuildHolograms(slots, bad, full)
+					end
+				elseif hologramKey then
+					hologramKey = nil
+					ClearHolograms()
+				end
+			end)
+			if not ok then PlaceStatus("Auto Place error: " .. tostring(problem)) end
+		end
+	end)
+
+	-- Play Macro
+	task.spawn(function()
+		local loaded, steps, finished = false, {}, false
+		local models, taken, bad = {}, {}, {}
+		local i, tries = 1, 0
+		local function advance() i, tries = i + 1, 0 end
+		local function retry(why)
+			tries += 1
+			if tries >= 5 then
+				MacroStatus(string.format("Step %d/%d skipped: %s", i, #steps, why))
+				advance()
+			end
+		end
+		-- your copy of a recorded unit: an equipped one with that unit id, the least placed first
+		local function MacroUnit(unitId)
+			local placed = {}
+			for _, m in MyUnits() do placed[m._stats.uuid.Value] = (placed[m._stats.uuid.Value] or 0) + 1 end
+			local best
+			for _, slot in SLOTS do
+				local uuid = SlotUuid(slot)
+				local u = Owned(uuid)
+				if u and u.unit_id == unitId and (not best or (placed[uuid] or 0) < (placed[best.uuid] or 0)) then best = { uuid = uuid, slot = tostring(slot) } end
+			end
+			return best
+		end
+		local seen = matchNo
+		while not closed do
+			task.wait(0.5)
+			Elevate()
+			if seen ~= matchNo then
+				seen, loaded, steps, finished = matchNo, false, {}, false
+				models, taken, bad, i, tries = {}, {}, {}, 1, 0
+			end
+			-- the macro can still change until its first step runs
+			if i == 1 and ActiveMacroName() ~= loaded then
+				loaded = ActiveMacroName()
+				steps = LoadMacro(loaded)
+				MacroStatus(string.format("%s / %s -> %s", tostring(CurrentMode()), tostring(MapKey()), loaded and (loaded .. " (" .. Summary(steps) .. ")") or "no macro"))
+			end
+			macroPending = State.PlayMacro and not State.RecordMacro and i <= #steps
+			if i > #steps then
+				if #steps > 0 and not finished then
+					finished = true
+					MacroStatus(tostring(loaded) .. " finished (" .. #steps .. " steps)")
+				end
+			elseif State.PlayMacro and not State.RecordMacro then
+				local step = steps[i]
+				local m = step.unit and models[step.unit]
+				local spawnStep = step.type == "spawn" and step or steps[step.unit or 0]
+				local name = UnitName((m and m.Parent and m._stats.id.Value) or (spawnStep and spawnStep.unit_id))
+				local function status(note) MacroStatus(string.format("Step %d/%d: %s %s - %s", i, #steps, step.type, name, note)) end
+				if step.type == "spawn" then
+					local mine = MacroUnit(step.unit_id)
+					local cost = SpawnCost(step.unit_id)
+					if not mine then
+						MacroStatus(string.format("Step %d/%d skipped: %s isn't on your team", i, #steps, name))
+						advance()
+					elseif Money() < cost then
+						status("waiting for " .. cost .. "¥")
+					else
+						local before, spot, origin, key = Snapshot(), nil, nil, nil
+						if State.MacroSlotSpots then
+							local anchor = PlaceAnchor(mine.slot, step.unit_id)
+							if anchor then spot, origin, key = FindSpot(Data.Units[step.unit_id], anchor, bad) end
+						end
+						local okSpawn
+						if origin then
+							okSpawn = Spawn(mine.uuid, origin)
+						else
+							okSpawn = Invoke("spawn_unit", mine.uuid, { Origin = V(step.origin), Direction = V(step.dir) }, step.rot or 0)
+						end
+						if okSpawn then
+							models[i] = NewUnit(mine.uuid, before, 3)
+							if models[i] then taken[models[i]] = true end
+							advance()
+						else
+							if key then bad[key] = true end
+							retry("server refused the spawn")
+						end
+					end
+				elseif not (m and m.Parent) then
+					MacroStatus(string.format("Step %d/%d skipped: its unit isn't on the map", i, #steps))
+					advance()
+				elseif step.type == "upgrade" then
+					local cost = UpgradeCost(m)
+					if not cost or (step.to and m._stats.upgrade.Value >= step.to) then
+						advance()
+					elseif Money() < cost then
+						status("waiting for " .. cost .. "¥")
+					elseif Invoke("upgrade_unit_ingame", InstanceId(m)) then
+						-- a recorded multi-level upgrade (to = level) repeats until it gets there
+						if not step.to or m._stats.upgrade.Value >= step.to then advance() end
+					else
+						retry("server refused the upgrade")
+					end
+				elseif Wave() < (step.wave or 0) then
+					status("waiting for wave " .. step.wave)
+				elseif step.type == "sell" then
+					Invoke("sell_unit_ingame", InstanceId(m))
+					advance()
+				else
+					Invoke("use_active_attack", InstanceId(m), nil, step.slot or 1)
+					advance()
+				end
+			end
+		end
+	end)
+
+	-- Auto Upgrade, abilities
+	task.spawn(function()
+		local lastAbility = 0
+		while not closed do
+			task.wait(1)
+			if State.AutoUpgrade and not macroPending and not (State.AutoPlace and State.PlaceBeforeUpgrade and placePending) then
+				local best = NextUpgrade()
+				if best and Money() >= best.cost then Invoke("upgrade_unit_ingame", InstanceId(best.model)) end
+			end
+
+			if State.AutoAbility and os.clock() - lastAbility > 3 then
+				lastAbility = os.clock()
+				local now = workspace:GetServerTimeNow()
+				local USC = Core.UnitServiceCore
+				for _, m in MyUnits() do
+					local st = m._stats
+					local u = Owned(st.uuid.Value)
+					if not (u and State.AbilityIgnore[UnitName(u.unit_id)]) then
+						for slot = 1, USC.MAX_ACTIVE_SLOTS or 1 do
+							local names = USC.active_slot_names(slot)
+							local attack, last, cd = st:FindFirstChild(names.attack), st:FindFirstChild(names.last_cast), st:FindFirstChild(names.cooldown)
+							if attack and last and cd and attack.Value ~= "nil" and attack.Value ~= "" and now - last.Value >= cd.Value then
+								task.spawn(Invoke, "use_active_attack", InstanceId(m), nil, slot)
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+--------------------------- [[ Misc ]] ---------------------------
+
+Track(LP.Idled:Connect(function()
+	if State.AntiAfk then
+		local vu = game:GetService("VirtualUser")
+		vu:CaptureController()
+		vu:ClickButton2(Vector2.new())
+	end
+end))
+
+--------------------------- [[ Unload ]] ---------------------------
+
+Env.ACXHub = {
+	State = State,
+	Unload = function()
+		if closed then return end
+		closed = true
+		WriteJson(PROFILE, State)
+		if EP.invoke_server == RecordingInvoke then EP.invoke_server = origInvoke end
+		for _, c in Connections do pcall(function() c:Disconnect() end) end
+		for _, ball in markers do pcall(function() ball:Destroy() end) end
+		ClearHolograms()
+		Env.ACXRefreshMacros, Env.ACXRefreshAssign, Env.ACXHub = nil, nil, nil
+		pcall(Starlight.Destroy, Starlight)
+	end,
+}
+Starlight:OnDestroy(function() if not closed then Env.ACXHub.Unload() end end)
+Notify("Loaded - Right Ctrl toggles the UI")
